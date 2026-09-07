@@ -363,14 +363,17 @@ export class Engine {
     for (const artifact of artifacts) {
       const asset = final.assets.find((item) => item.name === artifact.name);
       if (!asset) throw new Error("Remote asset inventory verification failed");
-      if (asset.digest === `sha256:${artifact.digest}`) continue;
+      if (asset.digest) {
+        if (asset.digest !== `sha256:${artifact.digest}`)
+          throw new Error("Remote asset inventory verification failed");
+        continue;
+      }
       // A successful response verifies this invocation's byte stream was accepted. On a
       // later retry, where that fact is unavailable, hash GitHub's stored object instead.
       if (uploaded.has(artifact.name)) continue;
       if (
-        asset.digest ||
         (await this.downloadAssetDigest(gh, project.repo, asset.id)) !==
-          artifact.digest
+        artifact.digest
       )
         throw new Error("Remote asset inventory verification failed");
     }
@@ -461,7 +464,7 @@ export class Engine {
     const page = [
       ...candidates.slice(start),
       ...candidates.slice(0, start),
-    ].slice(0, 100);
+    ].slice(0, 12);
     for (const candidate of page) {
       try {
         const { project, config, gh } = await this.context(candidate.id);

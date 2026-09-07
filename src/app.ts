@@ -342,29 +342,40 @@ export async function collectMetrics(services: Services) {
     "SELECT * FROM projects",
   );
   for (const project of projects) {
-    const gh = services.github
-      ? await GitHub.installation(services.github, project.installation_id)
-      : new GitHub("");
-    const repo = await gh.request<{ stargazers_count: number }>(
-      `/repos/${project.repo}`,
-    );
-    let downloads = 0,
-      page = 1;
-    while (true) {
-      const releases = await gh.request<
-        { assets: { download_count: number }[] }[]
-      >(`/repos/${project.repo}/releases?per_page=100&page=${page++}`);
-      for (const release of releases)
-        for (const asset of release.assets) downloads += asset.download_count;
-      if (releases.length < 100) break;
-    }
-    for (const [metric, value] of Object.entries({
-      stars: repo.stargazers_count,
-      downloads,
-    }))
-      await services.store.db.run(
-        "INSERT INTO metrics VALUES(?,?,?,?,?) ON CONFLICT(project_id,source,metric,day) DO UPDATE SET value=excluded.value",
-        [project.id, "github", metric, now().slice(0, 10), value],
+    try {
+      const gh = await githubForMetrics(services, project);
+      const repo = await gh.request<{ stargazers_count: number }>(
+        `/repos/${project.repo}`,
       );
+      let downloads = 0,
+        page = 1;
+      while (true) {
+        const releases = await gh.request<
+          { assets: { download_count: number }[] }[]
+        >(`/repos/${project.repo}/releases?per_page=100&page=${page++}`);
+        for (const release of releases)
+          for (const asset of release.assets) downloads += asset.download_count;
+        if (releases.length < 100) break;
+      }
+      for (const [metric, value] of Object.entries({
+        stars: repo.stargazers_count,
+        downloads,
+      }))
+        await services.store.db.run(
+          "INSERT INTO metrics VALUES(?,?,?,?,?) ON CONFLICT(project_id,source,metric,day) DO UPDATE SET value=excluded.value",
+          [project.id, "github", metric, now().slice(0, 10), value],
+        );
+    } catch (error) {
+      console.error(
+        `Could not collect GitHub metrics for ${project.repo}:`,
+        error instanceof Error ? error.message : String(error),
+      );
+    }
   }
+}
+
+export async function githubForMetrics(services: Services, project: Project) {
+  return services.github && project.installation_id > 0
+    ? GitHub.installation(services.github, project.installation_id)
+    : new GitHub("");
 }

@@ -103,9 +103,11 @@ export class Store {
     return job;
   }
   async finish(id: string, fence: number, error?: string) {
-    await this.db.run(
-      "UPDATE jobs SET state=?,error=? WHERE id=? AND fence=?",
-      [error ? "failed" : "done", error ?? null, id, fence],
+    return Boolean(
+      await this.db.run(
+        "UPDATE jobs SET state=?,error=? WHERE id=? AND fence=?",
+        [error ? "failed" : "done", error ?? null, id, fence],
+      ),
     );
   }
 }

@@ -32,7 +32,7 @@ export class GitHub {
     const response = await fetch(`https://api.github.com${path}`, {
       method,
       headers: {
-        Authorization: `Bearer ${this.token}`,
+        ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}),
         Accept: "application/vnd.github+json",
         "User-Agent": "envol",
         "X-GitHub-Api-Version": "2022-11-28",
@@ -190,22 +190,29 @@ export class GitHub {
             mergeStateStatus: string;
             reviewDecision: string | null;
             state: string;
+            commits: {
+              nodes: {
+                commit: { statusCheckRollup: { state: string } | null };
+              }[];
+            };
           };
         };
       };
     }>("/graphql", "POST", {
       query:
-        "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){headRefOid baseRefOid mergeStateStatus reviewDecision state}}}",
+        "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){headRefOid baseRefOid mergeStateStatus reviewDecision state commits(last:1){nodes{commit{statusCheckRollup{state}}}}}}}",
       variables: { owner, name, number },
     });
     const pr = result.data?.repository.pullRequest;
+    const checks = pr?.commits.nodes[0]?.commit.statusCheckRollup?.state;
     if (
       result.errors ||
       !pr ||
       pr.headRefOid !== sha ||
       pr.baseRefOid !== base ||
       pr.state !== "OPEN" ||
-      pr.mergeStateStatus !== "CLEAN" ||
+      !["CLEAN", "BLOCKED"].includes(pr.mergeStateStatus) ||
+      checks !== "SUCCESS" ||
       pr.reviewDecision === "CHANGES_REQUESTED" ||
       pr.reviewDecision === "REVIEW_REQUIRED"
     )

@@ -78,15 +78,20 @@ export class Engine {
       else if (job.kind === "cancel")
         await this.cancel(job.candidate_id, fence);
       else throw new Error("Unknown job");
-      await store.finish(job.id, job.fence);
+      if (await store.finish(job.id, job.fence))
+        await store.db.run(
+          "UPDATE candidates SET error=NULL,updated_at=? WHERE id=?",
+          [now(), job.candidate_id],
+        );
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);
-      await store.finish(job.id, job.fence, message);
-      await store.db.run(
-        "UPDATE candidates SET error=?,updated_at=? WHERE id=?",
-        [message, now(), job.candidate_id],
-      );
-      await store.event(job.candidate_id, "error", message);
+      if (await store.finish(job.id, job.fence, message)) {
+        await store.db.run(
+          "UPDATE candidates SET error=?,updated_at=? WHERE id=?",
+          [message, now(), job.candidate_id],
+        );
+        await store.event(job.candidate_id, "error", message);
+      }
     }
     return true;
   }

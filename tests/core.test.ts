@@ -13,8 +13,9 @@ import {
   type Line,
 } from "../src/model.ts";
 import { LocalStorage } from "../src/local-storage.ts";
-import { bumpFile } from "../src/engine.ts";
-import { app } from "../src/app.ts";
+import { bumpFile, Engine } from "../src/engine.ts";
+import { app, githubForMetrics } from "../src/app.ts";
+import { GitHub } from "../src/github.ts";
 import { Miniflare, convertV4MiniflareOptions } from "miniflare";
 const schema = await readFile(
   new URL("../migrations/0001_initial.sql", import.meta.url),
@@ -45,12 +46,12 @@ async function exercise(db: Database) {
   const claims = await Promise.all([store.claim(), store.claim()]);
   assert.equal(claims.filter(Boolean).length, 1);
   const job = claims.find(Boolean)!;
-  await store.finish(job.id, job.fence - 1);
+  assert.equal(await store.finish(job.id, job.fence - 1), false);
   assert.equal(
     (await db.all<{ state: string }>("SELECT state FROM jobs"))[0].state,
     "running",
   );
-  await store.finish(job.id, job.fence);
+  assert.equal(await store.finish(job.id, job.fence), true);
   assert.equal(
     (await db.all<{ state: string }>("SELECT state FROM jobs"))[0].state,
     "done",
@@ -220,6 +221,115 @@ test("public API never exposes private projects or candidate artifacts", async (
       (await api.request("/api/admin/candidates/x/artifacts/y")).status,
       401,
     );
+  } finally {
+    db.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("release PR readiness accepts a freeze-blocked PR only after checks succeed", async () => {
+  class FakeGitHub extends GitHub {
+    constructor(
+      private readonly merge: string,
+      private readonly checks: string,
+    ) {
+      super("test");
+    }
+    override async request<T>(): Promise<T> {
+      return {
+        data: {
+          repository: {
+            pullRequest: {
+              headRefOid: "candidate",
+              baseRefOid: "base",
+              mergeStateStatus: this.merge,
+              reviewDecision: "APPROVED",
+              state: "OPEN",
+              commits: {
+                nodes: [
+                  { commit: { statusCheckRollup: { state: this.checks } } },
+                ],
+              },
+            },
+          },
+        },
+      } as T;
+    }
+  }
+  await new FakeGitHub("CLEAN", "SUCCESS").assertPullRequestReady(
+    "owner/repo",
+    1,
+    "candidate",
+    "base",
+  );
+  await new FakeGitHub("BLOCKED", "SUCCESS").assertPullRequestReady(
+    "owner/repo",
+    1,
+    "candidate",
+    "base",
+  );
+  await assert.rejects(() =>
+    new FakeGitHub("BLOCKED", "PENDING").assertPullRequestReady(
+      "owner/repo",
+      1,
+      "candidate",
+      "base",
+    ),
+  );
+  await assert.rejects(() =>
+    new FakeGitHub("DIRTY", "SUCCESS").assertPullRequestReady(
+      "owner/repo",
+      1,
+      "candidate",
+      "base",
+    ),
+  );
+});
+
+test("seeded projects use unauthenticated GitHub metrics access", async () => {
+  const project = { installation_id: 0 } as any;
+  const gh = await githubForMetrics(
+    { github: { appId: "1", privateKey: "unused" } } as any,
+    project,
+  );
+  assert.equal(gh.token, "");
+});
+
+test("a successful retry clears the candidate's previous error", async () => {
+  const db = new SQLiteStore(":memory:");
+  const dir = await mkdtemp(join(tmpdir(), "envol-retry-"));
+  try {
+    db.raw.exec(schema);
+    await db.run("INSERT INTO projects VALUES(?,?,?,?,?,?)", [
+      "p",
+      "owner/repo",
+      1,
+      0,
+      "{}",
+      "now",
+    ]);
+    await db.run(
+      "INSERT INTO lines(id,project_id,name,branch,channel) VALUES(?,?,?,?,?)",
+      ["l", "p", "stable", "main", "stable"],
+    );
+    const store = new Store(db);
+    const line = (await db.all<Line>("SELECT * FROM lines"))[0];
+    const candidate = await store.create(line, "1.0.0", "retry");
+    await db.run("UPDATE candidates SET error=? WHERE id=?", [
+      "old failure",
+      candidate.id,
+    ]);
+    class SuccessfulEngine extends Engine {
+      override async prepare() {}
+    }
+    const engine = new SuccessfulEngine({
+      store,
+      storage: new LocalStorage(dir),
+      credentials: { appId: "unused", privateKey: "unused" },
+      url: "https://envol.test",
+    });
+    assert.equal(await engine.runOne(), true);
+    assert.equal((await store.candidate(candidate.id)).error, null);
   } finally {
     db.close();
     await rm(dir, { recursive: true, force: true });

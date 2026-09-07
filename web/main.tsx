@@ -34,9 +34,7 @@ const initial: Overview = {
   metrics: [],
 };
 function App() {
-  const [token, setToken] = useState(
-      sessionStorage.getItem("envol-token") ?? "",
-    ),
+  const [connected, setConnected] = useState(false),
     [data, setData] = useState(initial),
     [tab, setTab] = useState("Releases"),
     [error, setError] = useState(""),
@@ -54,9 +52,10 @@ function App() {
   ): Promise<any> {
     const res = await fetch(path, {
       method: body ? "POST" : "GET",
+      credentials: "same-origin",
       headers: {
-        Authorization: `Bearer ${token}`,
         "Content-Type": "application/json",
+        ...(body ? { "X-Envol-CSRF": "1" } : {}),
         ...(key ? { "Idempotency-Key": key } : {}),
       },
       body: body ? JSON.stringify(body) : undefined,
@@ -68,10 +67,16 @@ function App() {
   async function refresh() {
     setLoading(true);
     try {
-      if (token) setData(await request("/api/admin/overview"));
-      else {
+      const response = await fetch("/api/admin/overview", {
+        credentials: "same-origin",
+      });
+      if (response.ok) {
+        setData((await response.json()) as Overview);
+        setConnected(true);
+      } else {
         const projects = await request("/api/public/projects");
         setData({ ...initial, projects });
+        setConnected(false);
       }
       setError("");
     } catch (e) {
@@ -84,7 +89,7 @@ function App() {
     refresh();
     const timer = setInterval(refresh, 15000);
     return () => clearInterval(timer);
-  }, [token]);
+  }, [connected]);
   useEffect(() => {
     if (!selected) return;
     request(`/api/admin/candidates/${selected}`)
@@ -125,7 +130,7 @@ function App() {
           <span className="avatar">e</span>
           <div>
             Flight control
-            <small>{token ? "Your workspace" : "Public workspace"}</small>
+            <small>{connected ? "Your workspace" : "Public workspace"}</small>
           </div>
         </div>
         <div className="nav-label">WORKSPACE</div>
@@ -151,7 +156,7 @@ function App() {
           <div className="status-dot" />{" "}
           {data.configured ? "GitHub App connected" : "Local workspace"}
           <button onClick={() => setModal("connect")}>
-            {token ? "Change connection" : "Connect workspace"} ↗
+            {connected ? "Change connection" : "Connect workspace"} ↗
           </button>
           <a href="https://github.com/jdx/envol">Open source on GitHub ↗</a>
         </div>
@@ -192,7 +197,7 @@ function App() {
               className="primary"
               onClick={() =>
                 setModal(
-                  token
+                  connected
                     ? tab === "Projects"
                       ? "project"
                       : "release"
@@ -246,9 +251,11 @@ function App() {
                   </p>
                   <button
                     className="secondary"
-                    onClick={() => setModal(token ? "project" : "connect")}
+                    onClick={() => setModal(connected ? "project" : "connect")}
                   >
-                    {token ? "Connect your first project" : "Connect workspace"}{" "}
+                    {connected
+                      ? "Connect your first project"
+                      : "Connect workspace"}{" "}
                     ↗
                   </button>
                 </div>
@@ -469,7 +476,7 @@ function App() {
                   </article>
                 );
               })}
-              {token && (
+              {connected && (
                 <button
                   className="secondary"
                   onClick={async () => {
@@ -530,8 +537,22 @@ function App() {
                 try {
                   if (modal === "connect") {
                     const value = String(values.get("token"));
-                    sessionStorage.setItem("envol-token", value);
-                    setToken(value);
+                    const response = await fetch("/api/auth/session", {
+                      method: "POST",
+                      credentials: "same-origin",
+                      headers: {
+                        "Content-Type": "application/json",
+                        "X-Envol-CSRF": "1",
+                      },
+                      body: JSON.stringify({ token: value }),
+                    });
+                    if (!response.ok) {
+                      const body = (await response.json()) as {
+                        error?: string;
+                      };
+                      throw new Error(body.error ?? "Connection failed");
+                    }
+                    setConnected(true);
                   } else if (modal === "project")
                     await request("/api/admin/projects", {
                       repo: values.get("repo"),
@@ -557,8 +578,9 @@ function App() {
               {modal === "connect" ? (
                 <>
                   <p>
-                    Enter your server’s administrator token. It stays in this
-                    browser tab’s session.
+                    Enter your server’s administrator token. It is exchanged
+                    once for an HttpOnly session cookie and is never stored by
+                    the dashboard.
                   </p>
                   <label>
                     Administrator token

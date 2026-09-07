@@ -140,7 +140,10 @@ export function nextVersion(
   bump: "major" | "minor" | "patch",
   channel = "stable",
 ) {
-  const next = semver.inc(current, bump);
+  const next =
+    channel === "stable"
+      ? semver.inc(current, bump)
+      : semver.inc(current, `pre${bump}` as semver.ReleaseType, channel, "1");
   if (!next) throw new Error("Invalid current version");
-  return channel === "stable" ? next : `${next}-${channel}.1`;
+  return next;
 }

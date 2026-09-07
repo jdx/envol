@@ -14,8 +14,9 @@ import {
 } from "../src/model.ts";
 import { LocalStorage } from "../src/local-storage.ts";
 import { bumpFile, Engine } from "../src/engine.ts";
-import { app, githubForMetrics } from "../src/app.ts";
+import { app, collectMetrics, githubForMetrics } from "../src/app.ts";
 import { GitHub } from "../src/github.ts";
+import { milestone } from "../src/metrics.ts";
 import { Miniflare, convertV4MiniflareOptions } from "miniflare";
 const schema = await readFile(
   new URL("../migrations/0001_initial.sql", import.meta.url),
@@ -125,6 +126,7 @@ test("version policy prevents stable prereleases and wrong channels", () => {
     assert.throws(() => releaseVersion(v, "stable"));
   assert.throws(() => releaseVersion("2.0.0-alpha.1", "beta"));
   assert.equal(nextVersion("1.2.3", "major", "alpha"), "2.0.0-alpha.1");
+  assert.equal(nextVersion("2.0.0-alpha.1", "minor", "alpha"), "2.1.0-alpha.1");
 });
 test("configuration validates paths, release lines and exact artifact inventory", async () => {
   const source = await readFile(
@@ -140,9 +142,11 @@ test("configuration validates paths, release lines and exact artifact inventory"
   );
 });
 test("version edits support Cargo workspaces and package.json", () => {
-  assert.match(
-    bumpFile("Cargo.toml", '[workspace.package]\nversion="0.1.0"', "2.0.0"),
-    /2.0.0/,
+  const cargo =
+    '# keep me\n[workspace.package] # also me\nversion = "0.1.0" # pinned\n';
+  assert.equal(
+    bumpFile("Cargo.toml", cargo, "2.0.0"),
+    '# keep me\n[workspace.package] # also me\nversion = "2.0.0" # pinned\n',
   );
   assert.equal(
     JSON.parse(bumpFile("package.json", '{"version":"1.0.0"}', "2.0.0"))
@@ -151,6 +155,24 @@ test("version edits support Cargo workspaces and package.json", () => {
   );
   assert.throws(() =>
     bumpFile("Cargo.toml", '[package]\nname="test"', "2.0.0"),
+  );
+});
+
+test("milestones use the nearest point before the trailing cutoff", () => {
+  assert.deepEqual(
+    milestone([
+      { day: "2026-01-01", value: 100 },
+      { day: "2026-01-20", value: 120 },
+      { day: "2026-02-02", value: 132 },
+    ]),
+    {
+      target: 200,
+      current: 132,
+      asOf: "2026-02-02",
+      days: 68,
+      method:
+        "Projection based on the trailing 30-day net growth rate; growth can change.",
+    },
   );
 });
 test("local artifacts stream and reject path traversal", async () => {
@@ -221,6 +243,70 @@ test("public API never exposes private projects or candidate artifacts", async (
       (await api.request("/api/admin/candidates/x/artifacts/y")).status,
       401,
     );
+    const login = await api.request("/api/auth/session", {
+      method: "POST",
+      headers: {
+        Origin: "https://envol.test",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ token: "secret-token" }),
+    });
+    assert.equal(login.status, 200);
+    const setCookie = login.headers.get("Set-Cookie")!;
+    assert.match(setCookie, /HttpOnly/i);
+    assert.match(setCookie, /Secure/i);
+    assert.match(setCookie, /SameSite=Strict/i);
+    assert.doesNotMatch(setCookie, /secret-token/);
+    const cookie = setCookie.split(";", 1)[0];
+    assert.equal(
+      (
+        await api.request("/api/admin/overview", {
+          headers: { Cookie: cookie },
+        })
+      ).status,
+      200,
+    );
+    assert.equal(
+      (
+        await api.request("/api/admin/candidates/missing/retry", {
+          method: "POST",
+          headers: { Cookie: cookie },
+        })
+      ).status,
+      403,
+    );
+    const missing = await api.request("/api/admin/candidates/missing", {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(missing.status, 404);
+    assert.deepEqual(await missing.json(), { error: "Candidate not found" });
+    await db.run(
+      "INSERT INTO lines(id,project_id,name,branch,channel) VALUES(?,?,?,?,?)",
+      ["run-line", "public", "stable", "main", "stable"],
+    );
+    await db.run(
+      "INSERT INTO candidates(id,line_id,request_key,version,tag,state,sha,workflow_ref,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+      [
+        "run-candidate",
+        "run-line",
+        "request",
+        "1.0.0",
+        "v1.0.0",
+        "building",
+        "sha",
+        "owner/open/.github/workflows/release.yml@refs/heads/candidate",
+        "now",
+        "now",
+      ],
+    );
+    const invalidOidc = await api.request(
+      "/api/runs/run-candidate/artifacts/file.tar.gz",
+      { method: "PUT", headers: { Authorization: "Bearer invalid" } },
+    );
+    assert.equal(invalidOidc.status, 401);
+    assert.deepEqual(await invalidOidc.json(), {
+      error: "Invalid workflow identity",
+    });
   } finally {
     db.close();
     await rm(dir, { recursive: true, force: true });
@@ -331,6 +417,61 @@ test("a successful retry clears the candidate's previous error", async () => {
     assert.equal(await engine.runOne(), true);
     assert.equal((await store.candidate(candidate.id)).error, null);
   } finally {
+    db.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("metrics collection respects a shared request budget and never stores partial downloads", async () => {
+  const db = new SQLiteStore(":memory:");
+  const dir = await mkdtemp(join(tmpdir(), "envol-metrics-"));
+  const originalFetch = globalThis.fetch;
+  const urls: string[] = [];
+  try {
+    db.raw.exec(schema);
+    for (const [id, repo] of [
+      ["a", "owner/first"],
+      ["b", "owner/second"],
+    ])
+      await db.run("INSERT INTO projects VALUES(?,?,?,?,?,?)", [
+        id,
+        repo,
+        0,
+        1,
+        "{}",
+        "now",
+      ]);
+    globalThis.fetch = async (input) => {
+      const url = String(input);
+      urls.push(url);
+      if (url.includes("/releases?"))
+        return Response.json(
+          Array.from({ length: 100 }, () => ({ assets: [] })),
+        );
+      return Response.json({ stargazers_count: 12 });
+    };
+    await collectMetrics({
+      store: new Store(db),
+      storage: new LocalStorage(dir),
+      adminToken: "",
+      url: "https://envol.test",
+    });
+    assert.equal(urls.length, 45);
+    assert.equal(
+      (await db.all("SELECT * FROM metrics WHERE metric='downloads'")).length,
+      0,
+    );
+    assert.equal(
+      (await db.all("SELECT * FROM metrics WHERE metric='stars'")).length,
+      1,
+    );
+    assert.equal(
+      (await db.all<{ value: string }>("SELECT value FROM runtime_state"))[0]
+        .value,
+      "a",
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
     db.close();
     await rm(dir, { recursive: true, force: true });
   }

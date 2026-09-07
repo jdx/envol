@@ -3,6 +3,7 @@ import { one } from "./db.ts";
 import type { Candidate, Line, State } from "./model.ts";
 import { releaseVersion } from "./model.ts";
 export const now = () => new Date().toISOString();
+export class CandidateNotFoundError extends Error {}
 const edges: Partial<Record<State, State[]>> = {
   queued: ["preparing", "cancelling"],
   preparing: ["building", "blocked", "cancelling"],
@@ -21,7 +22,7 @@ export class Store {
       "SELECT * FROM candidates WHERE id=?",
       [id],
     );
-    if (!c) throw new Error("Candidate not found");
+    if (!c) throw new CandidateNotFoundError("Candidate not found");
     return c;
   }
   async event(id: string, kind: string, detail: string) {
@@ -109,5 +110,17 @@ export class Store {
         [error ? "failed" : "done", error ?? null, id, fence],
       ),
     );
+  }
+  async succeed(id: string, candidateId: string, fence: number) {
+    await this.db.batch([
+      {
+        sql: "UPDATE candidates SET error=NULL,updated_at=? WHERE id=? AND EXISTS(SELECT 1 FROM jobs WHERE id=? AND fence=? AND state='running')",
+        params: [now(), candidateId, id, fence],
+      },
+      {
+        sql: "UPDATE jobs SET state='done',error=NULL WHERE id=? AND fence=? AND state='running'",
+        params: [id, fence],
+      },
+    ]);
   }
 }

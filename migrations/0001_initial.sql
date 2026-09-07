@@ -41,3 +41,4 @@ CREATE TABLE IF NOT EXISTS metrics (
  day TEXT NOT NULL, value REAL NOT NULL, PRIMARY KEY(project_id,source,metric,day)
 );
 CREATE TABLE IF NOT EXISTS deliveries (id TEXT PRIMARY KEY, received_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS runtime_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);

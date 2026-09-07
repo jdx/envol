@@ -47,9 +47,16 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
       - run: cargo run --locked -- check
+  msrv:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.91.0
+      - run: cargo check --locked
   final:
     permissions: {}
-    needs: [format, application, cli]
+    needs: [format, application, cli, msrv]
     runs-on: ubuntu-latest
     timeout-minutes: 1
     # Run after upstream failures, but respect workflow cancellation.

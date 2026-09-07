@@ -12,6 +12,7 @@ release operations are disabled unless `ENVOL_RELEASES_ENABLED=true` is set.
 - Cloudflare Workers, D1, and R2 for the hosted deployment.
 - Node.js 24, SQLite, and local artifact storage for self-hosting.
 - Rust CLI in `crates/envol` for configuring and operating releases.
+- The Rust CLI uses the compiled `usage-rs` parser built on portable usage specs.
 - GitHub Actions runners build candidates; GitHub OIDC authenticates artifact uploads.
 
 The intended release sequence freezes the source branch with a dedicated GitHub

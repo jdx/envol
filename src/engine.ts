@@ -1,7 +1,7 @@
-import { parse, stringify } from "smol-toml";
+import { parse } from "smol-toml";
 import { Store, now } from "./store.ts";
 import { one } from "./db.ts";
-import { GitHub, type GitHubCredentials } from "./github.ts";
+import { GitHub, GitHubError, type GitHubCredentials } from "./github.ts";
 import type { Artifact, Candidate, Config, Line, Project } from "./model.ts";
 import type { Storage } from "./storage.ts";
 import { createHash } from "node:crypto";
@@ -78,11 +78,6 @@ export class Engine {
       else if (job.kind === "cancel")
         await this.cancel(job.candidate_id, fence);
       else throw new Error("Unknown job");
-      if (await store.finish(job.id, job.fence))
-        await store.db.run(
-          "UPDATE candidates SET error=NULL,updated_at=? WHERE id=?",
-          [now(), job.candidate_id],
-        );
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);
       if (await store.finish(job.id, job.fence, message)) {
@@ -92,7 +87,9 @@ export class Engine {
         );
         await store.event(job.candidate_id, "error", message);
       }
+      return true;
     }
+    await store.succeed(job.id, job.candidate_id, job.fence);
     return true;
   }
   async prepare(id: string, fence: () => Promise<void>) {
@@ -146,16 +143,13 @@ export class Engine {
           const contents = await gh.file(project.repo, path, base);
           files.push({ path, content: bumpFile(path, contents, c.version) });
         }
-        const changelog = await gh.optional<{ content: string }>(
-          `/repos/${project.repo}/contents/CHANGELOG.md?ref=${base}`,
-        );
-        const prior = changelog
-          ? new TextDecoder().decode(
-              Uint8Array.from(atob(changelog.content.replace(/\s/g, "")), (s) =>
-                s.charCodeAt(0),
-              ),
-            )
-          : "";
+        let prior = "";
+        try {
+          prior = await gh.file(project.repo, "CHANGELOG.md", base);
+        } catch (error) {
+          if (!(error instanceof GitHubError && error.status === 404))
+            throw error;
+        }
         files.push({
           path: "CHANGELOG.md",
           content: `# ${c.version}\n\nRelease prepared from ${base}.\n\n${prior}`,
@@ -176,7 +170,7 @@ export class Engine {
     }
     if (!c.pr) {
       const prs = await gh.request<{ number: number }[]>(
-        `/repos/${project.repo}/pulls?head=${encodeURIComponent(project.repo.split("/")[0] + ":" + branch)}&base=${encodeURIComponent(line.branch)}&state=all`,
+        `/repos/${project.repo}/pulls?head=${encodeURIComponent(project.repo.split("/")[0] + ":" + branch)}&base=${encodeURIComponent(line.branch)}&state=open`,
       );
       const pr =
         prs[0] ??
@@ -327,10 +321,14 @@ export class Engine {
         },
       );
     }
+    const uploaded = new Set<string>();
     for (const a of artifacts) {
       const existing = release.assets.find((x) => x.name === a.name);
       if (existing) {
-        if (existing.digest !== `sha256:${a.digest}`)
+        const digest = existing.digest
+          ? existing.digest
+          : `sha256:${await this.downloadAssetDigest(gh, project.repo, existing.id)}`;
+        if (digest !== `sha256:${a.digest}`)
           throw new Error(`Published asset conflicts: ${a.name}`);
         continue;
       }
@@ -357,19 +355,28 @@ export class Engine {
       );
       if (!response.ok)
         throw new Error(`Artifact upload failed: ${response.status}`);
+      uploaded.add(a.name);
     }
     const final = await gh.request<Release>(
       `/repos/${project.repo}/releases/${release.id}`,
     );
-    if (
-      artifacts.some(
-        (a) =>
-          !final.assets.some(
-            (x) => x.name === a.name && x.digest === `sha256:${a.digest}`,
-          ),
+    for (const artifact of artifacts) {
+      const asset = final.assets.find((item) => item.name === artifact.name);
+      if (!asset) throw new Error("Remote asset inventory verification failed");
+      if (asset.digest) {
+        if (asset.digest !== `sha256:${artifact.digest}`)
+          throw new Error("Remote asset inventory verification failed");
+        continue;
+      }
+      // A successful response verifies this invocation's byte stream was accepted. On a
+      // later retry, where that fact is unavailable, hash GitHub's stored object instead.
+      if (uploaded.has(artifact.name)) continue;
+      if (
+        (await this.downloadAssetDigest(gh, project.repo, asset.id)) !==
+        artifact.digest
       )
-    )
-      throw new Error("Remote asset inventory verification failed");
+        throw new Error("Remote asset inventory verification failed");
+    }
     if (final.draft) {
       await fence();
       await gh.request(
@@ -382,6 +389,26 @@ export class Engine {
       "UPDATE publications SET state='published',external_id=?,error=NULL WHERE candidate_id=? AND destination='github'",
       [String(release.id), c.id],
     );
+  }
+  private async downloadAssetDigest(gh: GitHub, repo: string, id: number) {
+    const response = await fetch(
+      `https://api.github.com/repos/${repo}/releases/assets/${id}`,
+      {
+        headers: {
+          Authorization: `Bearer ${gh.token}`,
+          Accept: "application/octet-stream",
+          "User-Agent": "envol",
+          "X-GitHub-Api-Version": "2022-11-28",
+        },
+      },
+    );
+    if (!response.ok || !response.body)
+      throw new Error(
+        `Artifact verification download failed: ${response.status}`,
+      );
+    const hash = createHash("sha256");
+    for await (const chunk of response.body) hash.update(chunk);
+    return hash.digest("hex");
   }
   async cancel(id: string, fence: () => Promise<void>) {
     const { c, line, project, gh } = await this.context(id),
@@ -421,9 +448,24 @@ export class Engine {
   }
   async reconcileBuilds() {
     const store = this.options.store;
-    for (const candidate of await store.db.all<Candidate>(
-      "SELECT * FROM candidates WHERE state='building'",
-    )) {
+    const candidates = await store.db.all<Candidate>(
+      "SELECT * FROM candidates WHERE state='building' ORDER BY id",
+    );
+    const cursor = await one<{ value: string }>(
+      store.db,
+      "SELECT value FROM runtime_state WHERE key='reconcile_cursor'",
+    );
+    const start = cursor
+      ? Math.max(
+          0,
+          candidates.findIndex((candidate) => candidate.id > cursor.value),
+        )
+      : 0;
+    const page = [
+      ...candidates.slice(start),
+      ...candidates.slice(0, start),
+    ].slice(0, 12);
+    for (const candidate of page) {
       try {
         const { project, config, gh } = await this.context(candidate.id);
         let runId = candidate.run_id;
@@ -490,6 +532,11 @@ export class Engine {
           "reconcile-error",
           error instanceof Error ? error.message : String(error),
         );
+      } finally {
+        await store.db.run(
+          "INSERT INTO runtime_state VALUES('reconcile_cursor',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+          [candidate.id],
+        );
       }
     }
   }
@@ -497,11 +544,14 @@ export class Engine {
 export function bumpFile(path: string, contents: string, version: string) {
   if (path.endsWith("Cargo.toml")) {
     const doc = parse(contents) as Record<string, any>;
-    if (typeof doc.package?.version === "string") doc.package.version = version;
-    else if (typeof doc.workspace?.package?.version === "string")
-      doc.workspace.package.version = version;
-    else throw new Error(`No literal version in ${path}`);
-    return stringify(doc);
+    const section =
+      typeof doc.package?.version === "string"
+        ? "package"
+        : typeof doc.workspace?.package?.version === "string"
+          ? "workspace.package"
+          : null;
+    if (!section) throw new Error(`No literal version in ${path}`);
+    return replaceTomlVersion(contents, section, version, path);
   }
   if (path.endsWith("package.json")) {
     const doc = JSON.parse(contents);
@@ -509,4 +559,32 @@ export function bumpFile(path: string, contents: string, version: string) {
     return JSON.stringify(doc, null, 2) + "\n";
   }
   throw new Error(`Unsupported version file: ${path}`);
+}
+
+function replaceTomlVersion(
+  contents: string,
+  section: string,
+  version: string,
+  path: string,
+) {
+  const lines = contents.split(/(?<=\n)/);
+  let active = false;
+  for (let index = 0; index < lines.length; index++) {
+    const header = lines[index].match(
+      /^\s*\[\s*([^\]]+)\s*\]\s*(?:#.*)?(?:\r?\n)?$/,
+    );
+    if (header) {
+      active = header[1].replace(/\s/g, "") === section;
+      continue;
+    }
+    if (!active) continue;
+    const match = lines[index].match(
+      /^(\s*version\s*=\s*)(["'])([^"']*)(\2)([^\r\n]*)(\r?\n)?$/,
+    );
+    if (!match) continue;
+    lines[index] =
+      `${match[1]}${match[2]}${version}${match[4]}${match[5]}${match[6] ?? ""}`;
+    return lines.join("");
+  }
+  throw new Error(`No literal version in ${path}`);
 }

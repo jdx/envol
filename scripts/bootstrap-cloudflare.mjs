@@ -1,9 +1,10 @@
 // Executed only by GitHub Actions. No local Cloudflare login is required.
 import { readFile, writeFile } from "node:fs/promises";
+import { parse } from "jsonc-parser";
 const token = process.env.CLOUDFLARE_API_TOKEN;
 if (!token)
   throw new Error("Configure CLOUDFLARE_API_TOKEN in GitHub Actions secrets");
-const config = JSON.parse(await readFile("wrangler.jsonc", "utf8"));
+const config = parse(await readFile("wrangler.jsonc", "utf8"));
 const account = config.account_id;
 async function api(path, method = "GET", body) {
   const response = await fetch(

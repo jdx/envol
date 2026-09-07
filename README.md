@@ -3,8 +3,10 @@
 A release control plane for CLIs: prepare a candidate, build and test it once,
 then promote the exact tested commit and publish the retained artifacts.
 
-**Early implementation, not yet validated for production releases.** Live
-release operations are disabled unless `ENVOL_RELEASES_ENABLED=true` is set.
+> [!WARNING]
+> **Work in progress:** Envol is an early implementation and has not yet been
+> validated for production releases. Live release operations are disabled unless
+> `ENVOL_RELEASES_ENABLED=true` is set.
 
 ## Architecture
 

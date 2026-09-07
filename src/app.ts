@@ -1,7 +1,8 @@
 import { Hono } from "hono";
-import { createRemoteJWKSet, jwtVerify } from "jose";
+import { getCookie, setCookie } from "hono/cookie";
+import { createRemoteJWKSet, errors as joseErrors, jwtVerify } from "jose";
 import { createHash, timingSafeEqual } from "node:crypto";
-import { Store, now } from "./store.ts";
+import { CandidateNotFoundError, Store, now } from "./store.ts";
 import { one } from "./db.ts";
 import {
   configFromToml,
@@ -14,6 +15,7 @@ import { Engine } from "./engine.ts";
 import type { Storage } from "./storage.ts";
 import type { GitHubCredentials } from "./github.ts";
 import { GitHub } from "./github.ts";
+import { RequestError } from "./errors.ts";
 export interface Services {
   store: Store;
   storage: Storage;
@@ -31,16 +33,46 @@ function equal(a: string, b: string) {
     bb = Buffer.from(b);
   return aa.length === bb.length && timingSafeEqual(aa, bb);
 }
+const sessionName = "envol_session";
+async function signSession(secret: string, timestamp: string) {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const signature = await crypto.subtle.sign(
+    "HMAC",
+    key,
+    new TextEncoder().encode(timestamp),
+  );
+  return Buffer.from(signature).toString("base64url");
+}
+async function validSession(secret: string, value?: string) {
+  if (!secret || !value) return false;
+  const [timestamp, signature, extra] = value.split(".");
+  const issued = Number(timestamp);
+  if (
+    extra ||
+    !Number.isSafeInteger(issued) ||
+    issued > Date.now() ||
+    Date.now() - issued > 12 * 60 * 60 * 1000
+  )
+    return false;
+  return equal(signature ?? "", await signSession(secret, timestamp));
+}
 export function app(services: Services) {
   const api = new Hono(),
     { store, storage } = services,
     db = store.db;
   const engine = () => {
     if (!services.github)
-      throw new Error("GitHub App credentials are not configured");
+      throw new RequestError("GitHub App credentials are not configured", 503);
     if (!services.releasesEnabled)
-      throw new Error(
+      throw new RequestError(
         "Release operations are disabled until repository onboarding is verified",
+        409,
       );
     return new Engine({
       store,
@@ -50,10 +82,40 @@ export function app(services: Services) {
     });
   };
   api.onError((error, c) => {
+    if (error instanceof CandidateNotFoundError)
+      return c.json({ error: "Candidate not found" }, 404);
+    if (error instanceof joseErrors.JOSEError)
+      return c.json({ error: "Invalid workflow identity" }, 401);
+    if (error instanceof SyntaxError)
+      return c.json({ error: "Invalid request" }, 400);
+    if (error instanceof RequestError)
+      return c.json({ error: error.message }, error.status);
     console.error(error);
-    return c.json({ error: error.message }, 400);
+    return c.json({ error: "Internal server error" }, 500);
   });
   api.get("/health", (c) => c.json({ status: "ok", service: "envol" }));
+  api.post("/api/auth/session", async (c) => {
+    const origin = c.req.header("Origin");
+    if (!origin || origin !== new URL(services.url).origin)
+      return c.json({ error: "Origin mismatch" }, 403);
+    const body = await c.req.json<{ token?: string }>();
+    if (!services.adminToken || !equal(body.token ?? "", services.adminToken))
+      return c.json({ error: "Authentication required" }, 401);
+    const timestamp = String(Date.now());
+    setCookie(
+      c,
+      sessionName,
+      `${timestamp}.${await signSession(services.adminToken, timestamp)}`,
+      {
+        httpOnly: true,
+        secure: true,
+        sameSite: "Strict",
+        path: "/",
+        maxAge: 12 * 60 * 60,
+      },
+    );
+    return c.json({ ok: true });
+  });
   api.get("/api/public/projects", async (c) =>
     c.json(
       await db.all(
@@ -84,8 +146,20 @@ export function app(services: Services) {
   });
   api.use("/api/admin/*", async (c, next) => {
     const token = c.req.header("Authorization")?.replace(/^Bearer /, "") ?? "";
-    if (!services.adminToken || !equal(token, services.adminToken))
+    const bearer = services.adminToken && equal(token, services.adminToken);
+    const cookie = await validSession(
+      services.adminToken,
+      getCookie(c, sessionName),
+    );
+    if (!bearer && !cookie)
       return c.json({ error: "Authentication required" }, 401);
+    if (
+      cookie &&
+      !["GET", "HEAD", "OPTIONS"].includes(c.req.method) &&
+      (c.req.header("Origin") !== new URL(services.url).origin ||
+        c.req.header("X-Envol-CSRF") !== "1")
+    )
+      return c.json({ error: "CSRF validation failed" }, 403);
     await next();
   });
   api.get("/api/admin/overview", async (c) =>
@@ -104,20 +178,23 @@ export function app(services: Services) {
   api.post("/api/admin/projects", async (c) => {
     const body = await c.req.json();
     if (typeof body.repo !== "string" || !/^[-\w.]+\/[-\w.]+$/.test(body.repo))
-      throw new Error("Use owner/repository");
+      throw new RequestError("Use owner/repository");
     if (!Number.isSafeInteger(body.installation_id) || body.installation_id < 1)
-      throw new Error("GitHub App installation ID required");
+      throw new RequestError("GitHub App installation ID required");
     const config = configFromToml(body.config),
       id = crypto.randomUUID();
     if (!services.github)
-      throw new Error("Configure GitHub App before onboarding repositories");
+      throw new RequestError(
+        "Configure GitHub App before onboarding repositories",
+        503,
+      );
     const gh = await GitHub.installation(services.github, body.installation_id);
     const repository = await gh.request<{
       permissions?: { admin: boolean };
       private: boolean;
     }>(`/repos/${body.repo}`);
     if (body.public && repository.private)
-      throw new Error("Private repositories cannot have public pages");
+      throw new RequestError("Private repositories cannot have public pages");
     // Read every source ref now; reject invalid configuration before inserting anything.
     for (const line of Object.values(config.lines))
       await gh.head(body.repo, line.branch);
@@ -181,11 +258,11 @@ export function app(services: Services) {
     const action = c.req.param("action");
     if (action === "promote") {
       if (candidate.state !== "ready")
-        throw new Error("Candidate is not ready");
+        throw new RequestError("Candidate is not ready", 409);
       await store.enqueue(candidate.id, "promote");
     } else if (action === "cancel") {
       if (["promoting", "publishing", "released"].includes(candidate.state))
-        throw new Error("Publication has begun; resume instead");
+        throw new RequestError("Publication has begun; resume instead", 409);
       candidate = await store.transition(candidate, "cancelling");
       await store.enqueue(candidate.id, "cancel");
     } else if (action === "retry") {
@@ -194,9 +271,9 @@ export function app(services: Services) {
         "SELECT kind FROM jobs WHERE candidate_id=? AND state='failed' ORDER BY rowid DESC LIMIT 1",
         [candidate.id],
       );
-      if (!job) throw new Error("No failed job");
+      if (!job) throw new RequestError("No failed job", 409);
       await store.enqueue(candidate.id, job.kind);
-    } else throw new Error("Unknown action");
+    } else throw new RequestError("Unknown action");
     return c.json({ ok: true });
   });
   api.post("/api/admin/tick", async (c) => {
@@ -251,9 +328,9 @@ export function app(services: Services) {
     const id = c.req.param("id"),
       name = c.req.param("name");
     if (!/^[-\w.]+$/.test(name) || name.length > 200)
-      throw new Error("Invalid artifact filename");
+      throw new RequestError("Invalid artifact filename");
     const body = c.req.raw.body;
-    if (!body) throw new Error("Artifact body required");
+    if (!body) throw new RequestError("Artifact body required");
     const key = `candidates/${id}/${crypto.randomUUID()}/${name}`;
     const hash = createHash("sha256");
     let size = 0;
@@ -276,7 +353,10 @@ export function app(services: Services) {
     if (existing) {
       await storage.delete(key);
       if (existing.digest !== digest || existing.size !== size)
-        throw new Error("Artifact is immutable; create a new candidate");
+        throw new RequestError(
+          "Artifact is immutable; create a new candidate",
+          409,
+        );
       return c.json(existing);
     }
     try {
@@ -284,7 +364,8 @@ export function app(services: Services) {
         "INSERT INTO artifacts SELECT ?,?,?,?,? WHERE EXISTS(SELECT 1 FROM candidates WHERE id=? AND state='building')",
         [id, name, digest, size, key, id],
       );
-      if (!inserted) throw new Error("Candidate stopped accepting artifacts");
+      if (!inserted)
+        throw new RequestError("Candidate stopped accepting artifacts", 409);
     } catch (e) {
       await storage.delete(key);
       throw e;
@@ -303,7 +384,7 @@ export function app(services: Services) {
         (name) => !artifacts.some((a) => a.name === name),
       )
     )
-      throw new Error("Required artifacts are missing");
+      throw new RequestError("Required artifacts are missing", 409);
     await store.event(
       id,
       "build-complete",
@@ -339,28 +420,50 @@ export function app(services: Services) {
 }
 export async function collectMetrics(services: Services) {
   const projects = await services.store.db.all<Project>(
-    "SELECT * FROM projects",
+    "SELECT * FROM projects ORDER BY id",
   );
-  for (const project of projects) {
+  const cursor = await one<{ value: string }>(
+    services.store.db,
+    "SELECT value FROM runtime_state WHERE key='metrics_cursor'",
+  );
+  const start = cursor
+    ? Math.max(
+        0,
+        projects.findIndex((project) => project.id === cursor.value) + 1,
+      )
+    : 0;
+  const rotated = [...projects.slice(start), ...projects.slice(0, start)];
+  // Stay below the Workers Free request ceiling, leaving headroom for platform work.
+  let remaining = 45;
+  for (const project of rotated) {
+    const authCost = services.github && project.installation_id > 0 ? 1 : 0;
+    if (remaining < authCost + 2) break;
+    remaining -= authCost;
     try {
       const gh = await githubForMetrics(services, project);
+      remaining--;
       const repo = await gh.request<{ stargazers_count: number }>(
         `/repos/${project.repo}`,
       );
       let downloads = 0,
-        page = 1;
-      while (true) {
+        page = 1,
+        complete = false;
+      while (remaining > 0) {
+        remaining--;
         const releases = await gh.request<
           { assets: { download_count: number }[] }[]
         >(`/repos/${project.repo}/releases?per_page=100&page=${page++}`);
         for (const release of releases)
           for (const asset of release.assets) downloads += asset.download_count;
-        if (releases.length < 100) break;
+        if (releases.length < 100) {
+          complete = true;
+          break;
+        }
       }
-      for (const [metric, value] of Object.entries({
-        stars: repo.stargazers_count,
-        downloads,
-      }))
+      const values = complete
+        ? { stars: repo.stargazers_count, downloads }
+        : { stars: repo.stargazers_count };
+      for (const [metric, value] of Object.entries(values))
         await services.store.db.run(
           "INSERT INTO metrics VALUES(?,?,?,?,?) ON CONFLICT(project_id,source,metric,day) DO UPDATE SET value=excluded.value",
           [project.id, "github", metric, now().slice(0, 10), value],
@@ -371,6 +474,10 @@ export async function collectMetrics(services: Services) {
         error instanceof Error ? error.message : String(error),
       );
     }
+    await services.store.db.run(
+      "INSERT INTO runtime_state VALUES('metrics_cursor',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+      [project.id],
+    );
   }
 }
 

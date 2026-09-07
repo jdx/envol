@@ -3,9 +3,17 @@ export interface GitHubCredentials {
   appId: string;
   privateKey: string;
 }
+const installationTokens = new Map<
+  string,
+  { token: string; expiresAt: number }
+>();
 export class GitHub {
   constructor(readonly token: string) {}
   static async installation(credentials: GitHubCredentials, id: number) {
+    const cacheKey = `${credentials.appId}:${id}`;
+    const cached = installationTokens.get(cacheKey);
+    if (cached && cached.expiresAt - 5 * 60 * 1000 > Date.now())
+      return new GitHub(cached.token);
     const key = await importPKCS8(
       credentials.privateKey.replace(/\\n/g, "\n"),
       "RS256",
@@ -17,10 +25,14 @@ export class GitHub {
       .setExpirationTime("9m")
       .sign(key);
     const app = new GitHub(jwt);
-    const result = await app.request<{ token: string }>(
+    const result = await app.request<{ token: string; expires_at: string }>(
       `/app/installations/${id}/access_tokens`,
       "POST",
     );
+    installationTokens.set(cacheKey, {
+      token: result.token,
+      expiresAt: Date.parse(result.expires_at),
+    });
     return new GitHub(result.token);
   }
   async request<T = Record<string, unknown>>(

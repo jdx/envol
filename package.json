@@ -14,7 +14,7 @@
     "test": "tsx --test tests/*.test.ts",
     "cf:dev": "wrangler dev",
     "cf:deploy": "npm run build && wrangler deploy",
-    "cf:migrate": "wrangler d1 migrations apply envol --remote"
+    "cf:migrate": "node scripts/bootstrap-cloudflare.mjs && wrangler d1 migrations apply envol --remote --config wrangler.ci.json"
   },
   "dependencies": {
     "@hono/node-server": "^1.19.0",
@@ -33,6 +33,7 @@
     "@types/react-dom": "^19.0.0",
     "@types/semver": "^7.7.0",
     "@vitejs/plugin-react": "^6.0.0",
+    "jsonc-parser": "^3.3.1",
     "miniflare": "^5.20260907.0-alpha",
     "prettier": "^3.9.6",
     "typescript": "^6.0.0",

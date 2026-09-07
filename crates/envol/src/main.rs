@@ -11,9 +11,6 @@ struct Args {
     /// Envol server URL.
     #[usage(long, global, env = "ENVOL_URL", default = "http://localhost:8787")]
     server: String,
-    /// Envol administrator token.
-    #[usage(long, global, env = "ENVOL_ADMIN_TOKEN", hide_env_values)]
-    token: Option<String>,
     #[usage(subcommand)]
     command: Command,
 }
@@ -77,9 +74,8 @@ fn main() -> Result<()> {
         println!("{}: configuration syntax is valid", file.display());
         return Ok(());
     }
-    let token = args
-        .token
-        .context("Set ENVOL_ADMIN_TOKEN or pass --token")?;
+    validate_server(&args.server)?;
+    let token = std::env::var("ENVOL_ADMIN_TOKEN").context("Set ENVOL_ADMIN_TOKEN")?;
     let (path, body) = match args.command {
         Command::Status => ("/api/admin/overview".into(), None),
         Command::Prepare(Prepare {
@@ -88,6 +84,7 @@ fn main() -> Result<()> {
             request_key,
         }) => {
             let key = request_key.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            eprintln!("Request key: {key} (reuse this key if retrying an uncertain request)");
             let response = Client::new()
                 .post(format!(
                     "{}/api/admin/lines/{line}/candidates",
@@ -97,7 +94,6 @@ fn main() -> Result<()> {
                 .header("Idempotency-Key", &key)
                 .json(&json!({ "version": version }))
                 .send()?;
-            eprintln!("Request key: {key} (reuse this key if retrying an uncertain request)");
             return print_response(response);
         }
         Command::Inspect(Candidate { candidate }) => {
@@ -125,6 +121,15 @@ fn main() -> Result<()> {
         None => client.get(url),
     };
     print_response(request.bearer_auth(token).send()?)
+}
+
+fn validate_server(server: &str) -> Result<()> {
+    let url = reqwest::Url::parse(server).context("Parse Envol server URL")?;
+    match url.scheme() {
+        "https" => Ok(()),
+        "http" if matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "::1")) => Ok(()),
+        _ => bail!("Envol server must use HTTPS (HTTP is allowed only on loopback)"),
+    }
 }
 
 fn print_response(response: reqwest::blocking::Response) -> Result<()> {
@@ -172,5 +177,13 @@ mod tests {
             panic!("expected check command");
         };
         assert_eq!(check.file, PathBuf::from("envol.toml"));
+    }
+
+    #[test]
+    fn rejects_cleartext_remote_servers() {
+        assert!(validate_server("https://envol.example").is_ok());
+        assert!(validate_server("http://localhost:8787").is_ok());
+        assert!(validate_server("http://127.0.0.1:8787").is_ok());
+        assert!(validate_server("http://envol.example").is_err());
     }
 }

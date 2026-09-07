@@ -115,14 +115,15 @@ export function milestone(points: { day: string; value: number }[]) {
     target =
       [1, 2, 5, 10].map((n) => n * scale).find((n) => n > latest.value) ??
       scale * 10;
-  const previous = sorted.find(
-    (p) =>
-      p.day ===
-      new Date(Date.parse(latest.day) - 30 * 86400000)
-        .toISOString()
-        .slice(0, 10),
-  );
-  const rate = previous ? (latest.value - previous.value) / 30 : 0;
+  const cutoff = new Date(Date.parse(latest.day) - 30 * 86400000)
+    .toISOString()
+    .slice(0, 10);
+  const previous = sorted.findLast((point) => point.day <= cutoff);
+  const span = previous
+    ? (Date.parse(latest.day) - Date.parse(previous.day)) / 86400000
+    : 0;
+  const rate =
+    previous && span > 0 ? (latest.value - previous.value) / span : 0;
   return {
     target,
     current: latest.value,

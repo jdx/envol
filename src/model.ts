@@ -1,5 +1,6 @@
 import semver from "semver";
 import { parse } from "smol-toml";
+import { RequestError } from "./errors.ts";
 export type State =
   | "queued"
   | "preparing"
@@ -62,13 +63,18 @@ export interface Config {
   lines: Record<string, { branch: string; channel: string }>;
 }
 export function configFromToml(text: string): Config {
-  const raw = parse(text) as Record<string, unknown>;
+  let raw: Record<string, unknown>;
+  try {
+    raw = parse(text) as Record<string, unknown>;
+  } catch {
+    throw new RequestError("Invalid project configuration");
+  }
   const workflow = raw.workflow ?? "envol.yml";
   const version_files = raw.version_files ?? ["Cargo.toml"];
   const required_artifacts = raw.required_artifacts;
   const lines = raw.lines;
   if (typeof workflow !== "string" || !/^[-\w.]+\.ya?ml$/.test(workflow))
-    throw new Error("workflow must be a YAML filename");
+    throw new RequestError("workflow must be a YAML filename");
   if (
     !Array.isArray(version_files) ||
     !version_files.length ||
@@ -79,7 +85,7 @@ export function configFromToml(text: string): Config {
         p.split("/").includes(".."),
     )
   )
-    throw new Error("Invalid version_files");
+    throw new RequestError("Invalid version_files");
   if (
     !Array.isArray(required_artifacts) ||
     !required_artifacts.length ||
@@ -87,14 +93,16 @@ export function configFromToml(text: string): Config {
       (p) => typeof p !== "string" || !/^[-\w.]+$/.test(p),
     )
   )
-    throw new Error("required_artifacts must list exact artifact filenames");
+    throw new RequestError(
+      "required_artifacts must list exact artifact filenames",
+    );
   if (
     !lines ||
     typeof lines !== "object" ||
     Array.isArray(lines) ||
     !Object.keys(lines).length
   )
-    throw new Error("Configure at least one release line");
+    throw new RequestError("Configure at least one release line");
   const branches = new Set<string>();
   for (const line of Object.values(lines) as {
     branch: unknown;
@@ -107,9 +115,9 @@ export function configFromToml(text: string): Config {
       typeof line.channel !== "string" ||
       !["stable", "alpha", "beta", "rc"].includes(line.channel)
     )
-      throw new Error("Invalid release line");
+      throw new RequestError("Invalid release line");
     if (branches.has(line.branch))
-      throw new Error("Each release line requires a different branch");
+      throw new RequestError("Each release line requires a different branch");
     branches.add(line.branch);
   }
   return {
@@ -123,16 +131,18 @@ export function configFromToml(text: string): Config {
 export function releaseVersion(version: string, channel: string): string {
   const parsed = semver.parse(version);
   if (!parsed || parsed.version !== version || parsed.build.length)
-    throw new Error("Use a concrete SemVer version without build metadata");
+    throw new RequestError(
+      "Use a concrete SemVer version without build metadata",
+    );
   if (channel === "stable" && parsed.prerelease.length)
-    throw new Error("Stable releases cannot be prereleases");
+    throw new RequestError("Stable releases cannot be prereleases");
   if (
     channel !== "stable" &&
     (parsed.prerelease[0] !== channel ||
       parsed.prerelease.length !== 2 ||
       typeof parsed.prerelease[1] !== "number")
   )
-    throw new Error(`Use ${channel}.N prerelease versions`);
+    throw new RequestError(`Use ${channel}.N prerelease versions`);
   return version;
 }
 export function nextVersion(
@@ -140,7 +150,10 @@ export function nextVersion(
   bump: "major" | "minor" | "patch",
   channel = "stable",
 ) {
-  const next = semver.inc(current, bump);
+  const next =
+    channel === "stable"
+      ? semver.inc(current, bump)
+      : semver.inc(current, `pre${bump}` as semver.ReleaseType, channel, "1");
   if (!next) throw new Error("Invalid current version");
-  return channel === "stable" ? next : `${next}-${channel}.1`;
+  return next;
 }

@@ -15,6 +15,7 @@ import { Engine } from "./engine.ts";
 import type { Storage } from "./storage.ts";
 import type { GitHubCredentials } from "./github.ts";
 import { GitHub } from "./github.ts";
+import { RequestError } from "./errors.ts";
 export interface Services {
   store: Store;
   storage: Storage;
@@ -67,10 +68,11 @@ export function app(services: Services) {
     db = store.db;
   const engine = () => {
     if (!services.github)
-      throw new Error("GitHub App credentials are not configured");
+      throw new RequestError("GitHub App credentials are not configured", 503);
     if (!services.releasesEnabled)
-      throw new Error(
+      throw new RequestError(
         "Release operations are disabled until repository onboarding is verified",
+        409,
       );
     return new Engine({
       store,
@@ -86,6 +88,8 @@ export function app(services: Services) {
       return c.json({ error: "Invalid workflow identity" }, 401);
     if (error instanceof SyntaxError)
       return c.json({ error: "Invalid request" }, 400);
+    if (error instanceof RequestError)
+      return c.json({ error: error.message }, error.status);
     console.error(error);
     return c.json({ error: "Internal server error" }, 500);
   });
@@ -174,20 +178,23 @@ export function app(services: Services) {
   api.post("/api/admin/projects", async (c) => {
     const body = await c.req.json();
     if (typeof body.repo !== "string" || !/^[-\w.]+\/[-\w.]+$/.test(body.repo))
-      throw new Error("Use owner/repository");
+      throw new RequestError("Use owner/repository");
     if (!Number.isSafeInteger(body.installation_id) || body.installation_id < 1)
-      throw new Error("GitHub App installation ID required");
+      throw new RequestError("GitHub App installation ID required");
     const config = configFromToml(body.config),
       id = crypto.randomUUID();
     if (!services.github)
-      throw new Error("Configure GitHub App before onboarding repositories");
+      throw new RequestError(
+        "Configure GitHub App before onboarding repositories",
+        503,
+      );
     const gh = await GitHub.installation(services.github, body.installation_id);
     const repository = await gh.request<{
       permissions?: { admin: boolean };
       private: boolean;
     }>(`/repos/${body.repo}`);
     if (body.public && repository.private)
-      throw new Error("Private repositories cannot have public pages");
+      throw new RequestError("Private repositories cannot have public pages");
     // Read every source ref now; reject invalid configuration before inserting anything.
     for (const line of Object.values(config.lines))
       await gh.head(body.repo, line.branch);
@@ -251,11 +258,11 @@ export function app(services: Services) {
     const action = c.req.param("action");
     if (action === "promote") {
       if (candidate.state !== "ready")
-        throw new Error("Candidate is not ready");
+        throw new RequestError("Candidate is not ready", 409);
       await store.enqueue(candidate.id, "promote");
     } else if (action === "cancel") {
       if (["promoting", "publishing", "released"].includes(candidate.state))
-        throw new Error("Publication has begun; resume instead");
+        throw new RequestError("Publication has begun; resume instead", 409);
       candidate = await store.transition(candidate, "cancelling");
       await store.enqueue(candidate.id, "cancel");
     } else if (action === "retry") {
@@ -264,9 +271,9 @@ export function app(services: Services) {
         "SELECT kind FROM jobs WHERE candidate_id=? AND state='failed' ORDER BY rowid DESC LIMIT 1",
         [candidate.id],
       );
-      if (!job) throw new Error("No failed job");
+      if (!job) throw new RequestError("No failed job", 409);
       await store.enqueue(candidate.id, job.kind);
-    } else throw new Error("Unknown action");
+    } else throw new RequestError("Unknown action");
     return c.json({ ok: true });
   });
   api.post("/api/admin/tick", async (c) => {
@@ -321,9 +328,9 @@ export function app(services: Services) {
     const id = c.req.param("id"),
       name = c.req.param("name");
     if (!/^[-\w.]+$/.test(name) || name.length > 200)
-      throw new Error("Invalid artifact filename");
+      throw new RequestError("Invalid artifact filename");
     const body = c.req.raw.body;
-    if (!body) throw new Error("Artifact body required");
+    if (!body) throw new RequestError("Artifact body required");
     const key = `candidates/${id}/${crypto.randomUUID()}/${name}`;
     const hash = createHash("sha256");
     let size = 0;
@@ -346,7 +353,10 @@ export function app(services: Services) {
     if (existing) {
       await storage.delete(key);
       if (existing.digest !== digest || existing.size !== size)
-        throw new Error("Artifact is immutable; create a new candidate");
+        throw new RequestError(
+          "Artifact is immutable; create a new candidate",
+          409,
+        );
       return c.json(existing);
     }
     try {
@@ -354,7 +364,8 @@ export function app(services: Services) {
         "INSERT INTO artifacts SELECT ?,?,?,?,? WHERE EXISTS(SELECT 1 FROM candidates WHERE id=? AND state='building')",
         [id, name, digest, size, key, id],
       );
-      if (!inserted) throw new Error("Candidate stopped accepting artifacts");
+      if (!inserted)
+        throw new RequestError("Candidate stopped accepting artifacts", 409);
     } catch (e) {
       await storage.delete(key);
       throw e;
@@ -373,7 +384,7 @@ export function app(services: Services) {
         (name) => !artifacts.some((a) => a.name === name),
       )
     )
-      throw new Error("Required artifacts are missing");
+      throw new RequestError("Required artifacts are missing", 409);
     await store.event(
       id,
       "build-complete",

@@ -22,6 +22,10 @@ const schema = await readFile(
   new URL("../migrations/0001_initial.sql", import.meta.url),
   "utf8",
 );
+const runtimeStateMigration = await readFile(
+  new URL("../migrations/0002_runtime_state.sql", import.meta.url),
+  "utf8",
+);
 async function exercise(db: Database) {
   await db.run("INSERT INTO projects VALUES(?,?,?,?,?,?)", [
     "p",
@@ -117,6 +121,28 @@ test("D1: same release contracts as SQLite", async () => {
     await exercise(new D1Store(db as unknown as D1Database));
   } finally {
     await mf.dispose();
+  }
+});
+test("runtime cursor migration upgrades databases created before cursors", async () => {
+  const db = new SQLiteStore(":memory:");
+  try {
+    db.raw.exec(
+      schema.replace(/CREATE TABLE IF NOT EXISTS runtime_state[^;]+;/, ""),
+    );
+    assert.throws(() => db.raw.prepare("SELECT * FROM runtime_state").all());
+    db.raw.exec(runtimeStateMigration);
+    await db.run("INSERT INTO runtime_state VALUES(?,?)", [
+      "cursor",
+      "project",
+    ]);
+    const rows = await db.all<{ key: string; value: string }>(
+      "SELECT * FROM runtime_state",
+    );
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].key, "cursor");
+    assert.equal(rows[0].value, "project");
+  } finally {
+    db.close();
   }
 });
 test("version policy prevents stable prereleases and wrong channels", () => {
@@ -239,6 +265,18 @@ test("public API never exposes private projects or candidate artifacts", async (
       ((await overview.json()) as { projects: unknown[] }).projects.length,
       2,
     );
+    const invalidProject = await api.request("/api/admin/projects", {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer secret-token",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ repo: "invalid", installation_id: 1 }),
+    });
+    assert.equal(invalidProject.status, 400);
+    assert.deepEqual(await invalidProject.json(), {
+      error: "Use owner/repository",
+    });
     assert.equal(
       (await api.request("/api/admin/candidates/x/artifacts/y")).status,
       401,

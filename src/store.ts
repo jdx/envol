@@ -2,6 +2,7 @@ import type { Database } from "./db.ts";
 import { one } from "./db.ts";
 import type { Candidate, Line, State } from "./model.ts";
 import { releaseVersion } from "./model.ts";
+import { RequestError } from "./errors.ts";
 export const now = () => new Date().toISOString();
 export class CandidateNotFoundError extends Error {}
 const edges: Partial<Record<State, State[]>> = {
@@ -33,7 +34,9 @@ export class Store {
   }
   async create(line: Line, version: string, key: string) {
     if (!key || key.length > 200)
-      throw new Error("Idempotency-Key required (maximum 200 characters)");
+      throw new RequestError(
+        "Idempotency-Key required (maximum 200 characters)",
+      );
     releaseVersion(version, line.channel);
     const existing = await one<Candidate>(
       this.db,
@@ -42,7 +45,10 @@ export class Store {
     );
     if (existing) {
       if (existing.version !== version)
-        throw new Error("Idempotency key already used for another version");
+        throw new RequestError(
+          "Idempotency key already used for another version",
+          409,
+        );
       return existing;
     }
     const id = crypto.randomUUID(),

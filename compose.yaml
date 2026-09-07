@@ -1,0 +1,13 @@
+services:
+  envol:
+    build: .
+    ports: ["127.0.0.1:8787:8787"]
+    volumes: ["envol-data:/data"]
+    environment:
+      ENVOL_URL: ${ENVOL_URL:-http://localhost:8787}
+      ENVOL_ADMIN_TOKEN: ${ENVOL_ADMIN_TOKEN:?Set a strong administrator token}
+      GITHUB_APP_ID: ${GITHUB_APP_ID:-}
+      GITHUB_PRIVATE_KEY: ${GITHUB_PRIVATE_KEY:-}
+    restart: unless-stopped
+volumes:
+  envol-data:

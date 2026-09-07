@@ -1,0 +1,7 @@
+node_modules/
+dist/
+target/
+.wrangler/
+data/
+package-lock.json
+wrangler.ci.json

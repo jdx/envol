@@ -1,0 +1,9 @@
+node_modules/
+dist/
+target/
+.wrangler/
+.env
+.dev.vars
+data/
+*.sqlite*
+wrangler.ci.json

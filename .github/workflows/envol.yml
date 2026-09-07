@@ -1,0 +1,40 @@
+name: Envol candidate
+run-name: Candidate ${{ inputs.candidate_id }}
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_id:
+        required: true
+        type: string
+      envol_url:
+        required: true
+        type: string
+permissions:
+  contents: read
+  id-token: write
+concurrency:
+  group: candidate-${{ inputs.candidate_id }}
+  cancel-in-progress: false
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - uses: dtolnay/rust-toolchain@stable
+      - run: npm ci && npm run check && npm test && npm run build
+      - run: cargo test --locked && cargo build --release --locked
+      - name: Test the release binary and prepare artifact
+        run: |
+          target/release/envol --version
+          target/release/envol check
+          mkdir -p dist-release
+          tar -czf dist-release/envol-linux-x64.tar.gz -C target/release envol
+      - name: Retain artifact and report validation
+        env:
+          ENVOL_URL: ${{ inputs.envol_url }}
+          ENVOL_CANDIDATE: ${{ inputs.candidate_id }}
+        run: node scripts/upload-candidate.mjs

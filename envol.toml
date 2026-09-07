@@ -1,0 +1,13 @@
+workflow = "envol.yml"
+version_files = ["Cargo.toml", "package.json"]
+required_artifacts = ["envol-linux-x64.tar.gz"]
+auto_promote = false
+
+[lines.stable]
+branch = "main"
+channel = "stable"
+
+# Enable after creating the branch:
+# [lines.next]
+# branch = "next"
+# channel = "alpha"

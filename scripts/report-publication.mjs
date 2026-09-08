@@ -17,6 +17,8 @@ if (
   !ACTIONS_ID_TOKEN_REQUEST_TOKEN
 )
   throw new Error("Missing Actions/Envol environment");
+const origin = new URL(ENVOL_URL);
+if (origin.protocol !== "https:") throw new Error("Envol requires HTTPS");
 const tokenURL = new URL(ACTIONS_ID_TOKEN_REQUEST_URL);
 tokenURL.searchParams.set("audience", ENVOL_URL);
 const tokenResponse = await fetch(tokenURL, {
@@ -24,6 +26,8 @@ const tokenResponse = await fetch(tokenURL, {
 });
 if (!tokenResponse.ok) throw new Error("Could not obtain GitHub OIDC token");
 const { value: token } = await tokenResponse.json();
+if (typeof token !== "string" || !token)
+  throw new Error("GitHub OIDC response contained no token");
 const response = await fetch(
   `${ENVOL_URL.replace(/\/$/, "")}/api/publish/${encodeURIComponent(ENVOL_CANDIDATE)}/report/${encodeURIComponent(ENVOL_DESTINATION)}`,
   {

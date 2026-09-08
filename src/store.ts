@@ -104,8 +104,8 @@ export class Store {
       fence: number;
     }>(
       this.db,
-      "UPDATE jobs SET state='running',lease_until=?,fence=fence+1,attempts=attempts+1 WHERE id=(SELECT j.id FROM jobs j WHERE (j.state='pending' OR (j.state='running' AND j.lease_until<?)) AND NOT EXISTS(SELECT 1 FROM jobs busy WHERE busy.candidate_id=j.candidate_id AND busy.id<>j.id AND busy.state='running' AND busy.lease_until>=?) ORDER BY j.rowid LIMIT 1) RETURNING *",
-      [time + 240000, time, time],
+      "UPDATE jobs SET state='running',lease_until=?,fence=fence+1,attempts=attempts+1 WHERE id=(SELECT j.id FROM jobs j WHERE ((j.state='pending' AND j.lease_until<=?) OR (j.state='running' AND j.lease_until<?)) AND NOT EXISTS(SELECT 1 FROM jobs busy WHERE busy.candidate_id=j.candidate_id AND busy.id<>j.id AND busy.state='running' AND busy.lease_until>=?) ORDER BY j.rowid LIMIT 1) RETURNING *",
+      [time + 240000, time, time, time],
     );
     return job;
   }
@@ -117,11 +117,11 @@ export class Store {
       ),
     );
   }
-  async defer(id: string, fence: number) {
+  async defer(id: string, fence: number, delay = 15000) {
     return Boolean(
       await this.db.run(
-        "UPDATE jobs SET state='pending',lease_until=0,error=NULL WHERE id=? AND fence=? AND state='running'",
-        [id, fence],
+        "UPDATE jobs SET state='pending',lease_until=?,error=NULL WHERE id=? AND fence=? AND state='running'",
+        [Date.now() + delay, id, fence],
       ),
     );
   }

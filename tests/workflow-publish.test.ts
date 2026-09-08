@@ -126,3 +126,45 @@ test("publication workflow creates a draft, uploads exact assets, then publishes
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test("publication workflow downloads an asset when GitHub omits its digest", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "envol-workflow-digest-"));
+  const originalFetch = globalThis.fetch;
+  try {
+    await writeFile(join(directory, "cli.tar.gz"), "retained bytes");
+    await writeFile(
+      join(directory, "manifest.json"),
+      JSON.stringify({
+        candidate: { sha: "candidate-sha", version: "1.0.0" },
+        artifacts: [
+          {
+            name: "cli.tar.gz",
+            digest:
+              "fb256b25e0c6295ffe7f2d26c984d128075acbf4ac614fbed75887eebe83fc0b",
+          },
+        ],
+      }),
+    );
+    globalThis.fetch = async (input) => {
+      if (String(input).endsWith("/releases/assets/8"))
+        return new Response("retained bytes");
+      return Response.json({
+        id: 7,
+        draft: false,
+        assets: [{ id: 8, name: "cli.tar.gz", digest: null }],
+      });
+    };
+    assert.equal(
+      await publishGitHubRelease({
+        token: "workflow-token",
+        repo: "owner/repo",
+        tag: "v1.0.0",
+        directory,
+      }),
+      "7",
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    await rm(directory, { recursive: true, force: true });
+  }
+});

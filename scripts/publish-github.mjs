@@ -35,9 +35,12 @@ async function remoteDigest(token, repo, asset) {
       },
     },
   );
-  if (!response.ok) throw new Error(`Could not verify ${asset.name}`);
+  if (!response.ok)
+    throw new Error(
+      `Could not verify ${asset.name}: GitHub ${response.status} ${await response.text()}`,
+    );
   return `sha256:${createHash("sha256")
-    .update(await response.arrayBuffer())
+    .update(new Uint8Array(await response.arrayBuffer()))
     .digest("hex")}`;
 }
 
@@ -93,7 +96,10 @@ export async function publishGitHubRelease({ token, repo, tag, directory }) {
         body: bytes,
       },
     );
-    if (!response.ok) throw new Error(`Artifact upload failed: ${name}`);
+    if (!response.ok)
+      throw new Error(
+        `Artifact upload failed: ${name}: GitHub ${response.status} ${await response.text()}`,
+      );
     const uploaded = await response.json();
     if (
       (await remoteDigest(token, repo, uploaded)) !==

@@ -27,9 +27,10 @@ for (const filename of filenames) {
   if (!/^[-\w.]+$/.test(filename))
     throw new Error(`Unsafe artifact filename: ${filename}`);
   const path = `dist-release/${filename}`,
-    info = await stat(path);
-  if (!info.isFile()) throw new Error(`Artifact is not a file: ${filename}`);
-  const file = await open(path);
+    entry = await stat(path);
+  if (!entry.isFile()) throw new Error(`Artifact is not a file: ${filename}`);
+  const file = await open(path),
+    info = await file.stat();
   try {
     const upload = await fetch(
       `${ENVOL_URL}/api/runs/${encodeURIComponent(ENVOL_CANDIDATE)}/artifacts/${encodeURIComponent(filename)}`,

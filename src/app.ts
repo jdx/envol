@@ -454,15 +454,15 @@ export function app(services: Services) {
       })),
     });
   });
-  api.get("/api/publish/:id/artifacts/:name", async (c) => {
+  const streamArtifact = async (candidateId: string, name: string) => {
     const artifact = await one<Artifact>(
       db,
       "SELECT * FROM artifacts WHERE candidate_id=? AND name=?",
-      [c.req.param("id"), c.req.param("name")],
+      [candidateId, name],
     );
-    if (!artifact) return c.notFound();
+    if (!artifact) return null;
     const object = await storage.get(artifact.storage_key);
-    if (!object) return c.notFound();
+    if (!object) return null;
     return new Response(object.body, {
       headers: {
         "Content-Type": "application/octet-stream",
@@ -470,6 +470,12 @@ export function app(services: Services) {
         "Content-Disposition": `attachment; filename="${artifact.name}"`,
       },
     });
+  };
+  api.get("/api/publish/:id/artifacts/:name", async (c) => {
+    return (
+      (await streamArtifact(c.req.param("id"), c.req.param("name"))) ??
+      c.notFound()
+    );
   });
   api.post("/api/publish/:id/report/:destination", async (c) => {
     const id = c.req.param("id"),
@@ -499,7 +505,7 @@ export function app(services: Services) {
     )
       throw new RequestError("Publication report is too large");
     const changed = await db.run(
-      "UPDATE publications SET state=?,external_id=?,error=? WHERE candidate_id=? AND destination=?",
+      "UPDATE publications SET state=?,external_id=?,error=? WHERE candidate_id=? AND destination=? AND state<>'published'",
       [
         body.status === "success" ? "reported" : "failed",
         body.external_id ?? null,
@@ -512,21 +518,10 @@ export function app(services: Services) {
     return c.json({ ok: true });
   });
   api.get("/api/admin/candidates/:id/artifacts/:name", async (c) => {
-    const artifact = await one<Artifact>(
-      db,
-      "SELECT * FROM artifacts WHERE candidate_id=? AND name=?",
-      [c.req.param("id"), c.req.param("name")],
+    return (
+      (await streamArtifact(c.req.param("id"), c.req.param("name"))) ??
+      c.notFound()
     );
-    if (!artifact) return c.notFound();
-    const object = await storage.get(artifact.storage_key);
-    if (!object) return c.notFound();
-    return new Response(object.body, {
-      headers: {
-        "Content-Type": "application/octet-stream",
-        "Content-Length": String(object.size),
-        "Content-Disposition": `attachment; filename="${artifact.name}"`,
-      },
-    });
   });
   api.all("/api/*", (c) => c.json({ error: "Not found" }, 404));
   api.get("*", (c) =>

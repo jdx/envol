@@ -20,11 +20,28 @@ const migrations = (await readdir(new URL("../migrations/", import.meta.url)))
 for (const name of migrations) {
   if (db.raw.prepare("SELECT 1 FROM schema_migrations WHERE name=?").get(name))
     continue;
+  let sql = await readFile(
+    new URL(`../migrations/${name}`, import.meta.url),
+    "utf8",
+  );
+  if (name === "0003_publish_workflow.sql") {
+    const columns = new Set(
+      db.raw
+        .prepare("PRAGMA table_info(candidates)")
+        .all()
+        .map((column) => (column as { name: string }).name),
+    );
+    sql = sql
+      .split("\n")
+      .filter((statement) => {
+        const column = statement.match(/ADD COLUMN (\w+)/)?.[1];
+        return !column || !columns.has(column);
+      })
+      .join("\n");
+  }
   db.raw.exec("BEGIN");
   try {
-    db.raw.exec(
-      await readFile(new URL(`../migrations/${name}`, import.meta.url), "utf8"),
-    );
+    db.raw.exec(sql);
     db.raw
       .prepare("INSERT INTO schema_migrations VALUES(?,?)")
       .run(name, new Date().toISOString());

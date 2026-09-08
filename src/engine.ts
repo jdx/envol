@@ -362,7 +362,7 @@ export class Engine {
       event: string;
       path: string;
     };
-    const expectedPath = `.github/workflows/${config.publish_workflow}@${c.tag}`;
+    const expectedPath = `.github/workflows/${config.publish_workflow}`;
     let dispatchAt = c.publish_dispatch_at;
     if (c.publish_run_id) {
       const run = await gh.request<Run>(
@@ -379,7 +379,7 @@ export class Engine {
       dispatchAt = null;
     }
     const runs = await gh.request<{ workflow_runs: Run[] }>(
-      `/repos/${project.repo}/actions/workflows/${config.publish_workflow}/runs?event=workflow_dispatch&per_page=100`,
+      `/repos/${project.repo}/actions/workflows/${config.publish_workflow}/runs?branch=${encodeURIComponent(c.tag)}&event=workflow_dispatch&per_page=100`,
     );
     const reconciled = runs.workflow_runs.find(
       (run) =>
@@ -398,10 +398,24 @@ export class Engine {
       throw new RetryJobError(
         "Waiting for publication workflow reconciliation",
       );
+    const dispatches = await one<{ count: number }>(
+      this.options.store.db,
+      "SELECT COUNT(*) AS count FROM events WHERE candidate_id=? AND kind='publish_dispatch'",
+      [c.id],
+    );
+    if ((dispatches?.count ?? 0) >= 3)
+      throw new Error(
+        "Publication workflow could not be reconciled after 3 dispatch attempts",
+      );
     await fence();
     await this.options.store.db.run(
       "UPDATE candidates SET publish_dispatch_at=? WHERE id=?",
       [now(), c.id],
+    );
+    await this.options.store.event(
+      c.id,
+      "publish_dispatch",
+      `Dispatching ${config.publish_workflow} for ${c.tag}`,
     );
     await gh.request(
       `/repos/${project.repo}/actions/workflows/${config.publish_workflow}/dispatches`,
@@ -570,7 +584,7 @@ export async function verifyGitHubPublication(
   const release = await gh.optional<{
     id: number;
     draft: boolean;
-    assets: { name: string; digest: string | null }[];
+    assets: { id: number; name: string; digest: string | null }[];
   }>(`/repos/${repo}/releases/tags/${tag}`);
   if (!release || release.draft)
     throw new Error("GitHub release is missing or still a draft");
@@ -578,7 +592,12 @@ export async function verifyGitHubPublication(
     const asset = release.assets.find((item) => item.name === artifact.name);
     if (!asset)
       throw new Error(`GitHub release is missing asset ${artifact.name}`);
-    if (asset.digest !== `sha256:${artifact.digest}`)
+    const digest =
+      asset.digest ??
+      `sha256:${createHash("sha256")
+        .update(await gh.releaseAsset(repo, asset.id))
+        .digest("hex")}`;
+    if (digest !== `sha256:${artifact.digest}`)
       throw new Error(`GitHub release asset digest mismatch: ${artifact.name}`);
   }
   return String(release.id);

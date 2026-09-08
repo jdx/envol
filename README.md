@@ -29,8 +29,9 @@ external release with read-only APIs before recording it as published. Publicati
 is resumable. Release lines configure stable, next-major prerelease, and maintenance
 branches.
 
-`envol.toml` selects `publishers = ["github"]` by default. Add `"crates"` to
-publish the exact `.crate` produced by the candidate workflow. crates.io Trusted
+Envol defaults to `publishers = ["github"]`; this repository opts into both
+GitHub and crates.io publication. Add `"crates"` to another project's publisher
+list to publish the exact `.crate` produced by its candidate workflow. crates.io Trusted
 Publishing is preferred; `CARGO_REGISTRY_TOKEN` is an optional fallback repository
 secret. Envol itself neither receives these credentials nor writes releases or
 registry packages.

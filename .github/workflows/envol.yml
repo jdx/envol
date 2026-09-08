@@ -27,7 +27,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: npm ci && npm run check && npm test && npm run build
       - run: cargo test --locked && cargo build --release --locked
-      - run: cargo package --locked
+      - run: cargo package --locked -p envol
       - name: Test the release binary and prepare artifact
         run: |
           target/release/envol --version

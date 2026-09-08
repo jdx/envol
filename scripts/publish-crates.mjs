@@ -1,10 +1,10 @@
 import { execFileSync } from "node:child_process";
 import { readFile, readdir, appendFile } from "node:fs/promises";
-import { dirname, relative } from "node:path";
+import { dirname, relative, resolve } from "node:path";
 
 const { CRATES_IO_TOKEN, GITHUB_OUTPUT } = process.env;
-if (!CRATES_IO_TOKEN || !GITHUB_OUTPUT)
-  throw new Error("No crates.io token available");
+if (!CRATES_IO_TOKEN) throw new Error("No crates.io token available");
+if (!GITHUB_OUTPUT) throw new Error("GITHUB_OUTPUT is not set");
 const manifest = JSON.parse(
   await readFile("dist-release/manifest.json", "utf8"),
 );
@@ -52,7 +52,9 @@ const pkg = metadata.packages.find(
 if (!pkg)
   throw new Error(`Cargo package metadata is missing for ${name}@${version}`);
 const root = dirname(pkg.manifest_path);
-const readme = pkg.readme ? await readFile(pkg.readme, "utf8") : null;
+const readmePath = pkg.readme ? resolve(root, pkg.readme) : null;
+const licensePath = pkg.license_file ? resolve(root, pkg.license_file) : null;
+const readme = readmePath ? await readFile(readmePath, "utf8") : null;
 const upload = {
   name,
   vers: version,
@@ -76,11 +78,11 @@ const upload = {
   documentation: pkg.documentation,
   homepage: pkg.homepage,
   readme,
-  readme_file: pkg.readme ? relative(root, pkg.readme) : null,
+  readme_file: readmePath ? relative(root, readmePath) : null,
   keywords: pkg.keywords,
   categories: pkg.categories,
   license: pkg.license,
-  license_file: pkg.license_file ? relative(root, pkg.license_file) : null,
+  license_file: licensePath ? relative(root, licensePath) : null,
   repository: pkg.repository,
   badges: {},
   links: pkg.links,

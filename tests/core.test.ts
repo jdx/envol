@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { readFile, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -72,6 +73,18 @@ async function exercise(db: Database) {
     (await db.all<{ state: string }>("SELECT state FROM jobs"))[0].state,
     "done",
   );
+  await db.run(
+    "INSERT INTO jobs(id,candidate_id,kind,state) VALUES('deferred',?,'test','pending')",
+    [first.id],
+  );
+  const deferred = await store.claim();
+  assert.ok(deferred);
+  assert.equal(await store.defer(deferred.id, deferred.fence, 60_000), true);
+  assert.equal(await store.claim(), undefined);
+  await db.run("UPDATE jobs SET lease_until=0 WHERE id='deferred'");
+  const reclaimed = await store.claim();
+  assert.equal(reclaimed?.id, "deferred");
+  assert.equal(await store.finish(reclaimed!.id, reclaimed!.fence), true);
   const preparing = await store.transition(first, "preparing");
   await assert.rejects(
     () => store.transition(first, "cancelling"),
@@ -208,15 +221,26 @@ const retainedArtifacts: Artifact[] = [
 test("GitHub publication verification requires every retained asset digest", async () => {
   class ReleaseGitHub extends GitHub {
     constructor(
-      private readonly assets: { name: string; digest: string | null }[],
+      private readonly assets: {
+        id: number;
+        name: string;
+        digest: string | null;
+      }[],
+      private readonly downloaded = new Map<number, Uint8Array>(),
     ) {
       super("read-only");
     }
     override async optional<T>(): Promise<T> {
       return { id: 42, draft: false, assets: this.assets } as T;
     }
+    override async releaseAsset(_repo: string, id: number) {
+      const bytes = this.downloaded.get(id);
+      if (!bytes) throw new Error(`Missing test asset ${id}`);
+      return bytes;
+    }
   }
-  const valid = retainedArtifacts.map((artifact) => ({
+  const valid = retainedArtifacts.map((artifact, index) => ({
+    id: index + 1,
     name: artifact.name,
     digest: `sha256:${artifact.digest}`,
   }));
@@ -251,6 +275,28 @@ test("GitHub publication verification requires every retained asset digest", asy
         retainedArtifacts,
       ),
     /digest mismatch/,
+  );
+  const bytes = new TextEncoder().encode("retained bytes");
+  const digest = createHash("sha256").update(bytes).digest("hex");
+  assert.equal(
+    await verifyGitHubPublication(
+      new ReleaseGitHub(
+        [{ id: 7, name: "asset", digest: null }],
+        new Map([[7, bytes]]),
+      ),
+      "owner/repo",
+      "v1.0.0",
+      [
+        {
+          candidate_id: "candidate",
+          name: "asset",
+          digest,
+          size: bytes.length,
+          storage_key: "asset",
+        },
+      ],
+    ),
+    "42",
   );
 });
 

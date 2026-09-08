@@ -2,7 +2,14 @@ import { parse } from "smol-toml";
 import { Store, now } from "./store.ts";
 import { one } from "./db.ts";
 import { GitHub, GitHubError, type GitHubCredentials } from "./github.ts";
-import type { Artifact, Candidate, Config, Line, Project } from "./model.ts";
+import type {
+  Artifact,
+  Candidate,
+  Config,
+  Line,
+  Project,
+  Publisher,
+} from "./model.ts";
 import type { Storage } from "./storage.ts";
 import { createHash } from "node:crypto";
 export interface EngineOptions {
@@ -12,7 +19,8 @@ export interface EngineOptions {
   url: string;
 }
 const disclosure =
-  "*AI-assisted — Tool: Codex; model: OpenAI/GPT-6; version: unavailable.*";
+  "*AI-assisted — Tool: Codex; model: unavailable; version: unavailable.*";
+class RetryJobError extends Error {}
 export class Engine {
   constructor(readonly options: EngineOptions) {}
   async context(id: string) {
@@ -32,12 +40,16 @@ export class Engine {
       this.options.credentials,
       project.installation_id,
     );
+    const storedConfig = JSON.parse(project.config) as Partial<Config>;
     return {
       c,
       line,
       project,
       gh,
-      config: JSON.parse(project.config) as Config,
+      config: Object.assign(
+        { publish_workflow: "envol-publish.yml", publishers: ["github"] },
+        storedConfig,
+      ) as Config,
     };
   }
   async runOne() {
@@ -79,6 +91,10 @@ export class Engine {
         await this.cancel(job.candidate_id, fence);
       else throw new Error("Unknown job");
     } catch (e) {
+      if (e instanceof RetryJobError) {
+        await store.defer(job.id, job.fence);
+        return true;
+      }
       const message = e instanceof Error ? e.message : String(e);
       if (await store.finish(job.id, job.fence, message)) {
         await store.db.run(
@@ -138,11 +154,22 @@ export class Engine {
       );
       if (existing) sha = existing.object.sha;
       else {
-        const files = [];
-        for (const path of config.version_files) {
-          const contents = await gh.file(project.repo, path, base);
-          files.push({ path, content: bumpFile(path, contents, c.version) });
-        }
+        const sourceFiles = await Promise.all(
+          config.version_files.map(async (path) => ({
+            path,
+            contents: await gh.file(project.repo, path, base),
+          })),
+        );
+        const manifestPackage = sourceFiles
+          .filter(({ path }) => path.endsWith("Cargo.toml"))
+          .map(({ contents }) => parse(contents) as Record<string, any>)
+          .map((manifest) => manifest.package?.name)
+          .find((name): name is string => typeof name === "string");
+        const cargoPackage = config.cargo_package ?? manifestPackage;
+        const files = sourceFiles.map(({ path, contents }) => ({
+          path,
+          content: bumpFile(path, contents, c.version, cargoPackage),
+        }));
         let prior = "";
         try {
           prior = await gh.file(project.repo, "CHANGELOG.md", base);
@@ -282,133 +309,125 @@ export class Engine {
       await store.db.run("UPDATE candidates SET frozen=0 WHERE id=?", [id]);
       c = await store.transition(await store.candidate(id), "publishing");
     }
-    await fence();
-    await this.publishGitHub(c, project, gh, artifacts, fence);
+    for (const destination of config.publishers)
+      await store.db.run(
+        "INSERT INTO publications(candidate_id,destination,state) VALUES(?,?,'pending') ON CONFLICT DO NOTHING",
+        [id, destination],
+      );
+    await store.db.run(
+      "UPDATE candidates SET publish_workflow_ref=? WHERE id=?",
+      [
+        `${project.repo}/.github/workflows/${config.publish_workflow}@refs/tags/${c.tag}`,
+        id,
+      ],
+    );
+    c = await store.candidate(id);
+    const publishRun = await this.publishRun(c, project, gh, config, fence);
+    if (publishRun.status !== "completed")
+      throw new RetryJobError("Publication workflow is still running");
+    if (publishRun.head_sha !== c.sha || publishRun.conclusion !== "success")
+      throw new Error(
+        `Publication workflow concluded ${publishRun.conclusion ?? "without success"}`,
+      );
+    for (const publisher of config.publishers) {
+      const externalId = await verifyPublication(
+        publisher,
+        c,
+        project,
+        gh,
+        artifacts,
+      );
+      await store.db.run(
+        "UPDATE publications SET state='published',external_id=?,error=NULL WHERE candidate_id=? AND destination=?",
+        [externalId, id, publisher],
+      );
+    }
+    const unfinished = await one(
+      store.db,
+      "SELECT destination FROM publications WHERE candidate_id=? AND state<>'published'",
+      [id],
+    );
+    if (unfinished) throw new Error("Publication verification is incomplete");
     await store.transition(await store.candidate(id), "released");
   }
-  async publishGitHub(
+  private async publishRun(
     c: Candidate,
     project: Project,
     gh: GitHub,
-    artifacts: Artifact[],
+    config: Config,
     fence: () => Promise<void>,
   ) {
-    const db = this.options.store.db;
-    await db.run(
-      "INSERT INTO publications(candidate_id,destination,state) VALUES(?,'github','pending') ON CONFLICT DO NOTHING",
-      [c.id],
-    );
-    type Release = {
+    type Run = {
       id: number;
-      draft: boolean;
-      assets: { id: number; name: string; digest: string | null }[];
+      status: string;
+      conclusion: string | null;
+      head_sha: string;
+      event: string;
+      path: string;
     };
-    let release = await gh.optional<Release>(
-      `/repos/${project.repo}/releases/tags/${c.tag}`,
-    );
-    if (!release) {
-      await fence();
-      release = await gh.request<Release>(
-        `/repos/${project.repo}/releases`,
-        "POST",
-        {
-          tag_name: c.tag,
-          target_commitish: c.sha,
-          name: c.tag,
-          draft: true,
-          prerelease: c.version.includes("-"),
-          body: `Release ${c.tag}.\n\nSource: ${c.sha}\n\n${disclosure}`,
-        },
+    const expectedPath = `.github/workflows/${config.publish_workflow}`;
+    let dispatchAt = c.publish_dispatch_at;
+    if (c.publish_run_id) {
+      const run = await gh.request<Run>(
+        `/repos/${project.repo}/actions/runs/${c.publish_run_id}`,
       );
-    }
-    const uploaded = new Set<string>();
-    for (const a of artifacts) {
-      const existing = release.assets.find((x) => x.name === a.name);
-      if (existing) {
-        const digest = existing.digest
-          ? existing.digest
-          : `sha256:${await this.downloadAssetDigest(gh, project.repo, existing.id)}`;
-        if (digest !== `sha256:${a.digest}`)
-          throw new Error(`Published asset conflicts: ${a.name}`);
-        continue;
-      }
-      if (!release.draft)
-        throw new Error(
-          "Published release is missing expected assets; manual recovery required",
-        );
-      const stored = await this.options.storage.get(a.storage_key);
-      if (!stored) throw new Error("Artifact missing");
-      await fence();
-      const response = await fetch(
-        `https://uploads.github.com/repos/${project.repo}/releases/${release.id}/assets?name=${encodeURIComponent(a.name)}`,
-        {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${gh.token}`,
-            "Content-Type": "application/octet-stream",
-            "Content-Length": String(a.size),
-            "User-Agent": "envol",
-          },
-          body: stored.body,
-          duplex: "half",
-        } as RequestInit,
+      if (run.head_sha !== c.sha || run.path !== expectedPath)
+        throw new Error("Publication workflow run does not match candidate");
+      if (run.status !== "completed" || run.conclusion === "success")
+        return run;
+      await this.options.store.db.run(
+        "UPDATE candidates SET publish_run_id=NULL,publish_dispatch_at=NULL WHERE id=? AND publish_run_id=?",
+        [c.id, c.publish_run_id],
       );
-      if (!response.ok)
-        throw new Error(`Artifact upload failed: ${response.status}`);
-      uploaded.add(a.name);
+      dispatchAt = null;
     }
-    const final = await gh.request<Release>(
-      `/repos/${project.repo}/releases/${release.id}`,
+    const runs = await gh.request<{ workflow_runs: Run[] }>(
+      `/repos/${project.repo}/actions/workflows/${config.publish_workflow}/runs?branch=${encodeURIComponent(c.tag)}&event=workflow_dispatch&per_page=100`,
     );
-    for (const artifact of artifacts) {
-      const asset = final.assets.find((item) => item.name === artifact.name);
-      if (!asset) throw new Error("Remote asset inventory verification failed");
-      if (asset.digest) {
-        if (asset.digest !== `sha256:${artifact.digest}`)
-          throw new Error("Remote asset inventory verification failed");
-        continue;
-      }
-      // A successful response verifies this invocation's byte stream was accepted. On a
-      // later retry, where that fact is unavailable, hash GitHub's stored object instead.
-      if (uploaded.has(artifact.name)) continue;
-      if (
-        (await this.downloadAssetDigest(gh, project.repo, asset.id)) !==
-        artifact.digest
-      )
-        throw new Error("Remote asset inventory verification failed");
-    }
-    if (final.draft) {
-      await fence();
-      await gh.request(
-        `/repos/${project.repo}/releases/${release.id}`,
-        "PATCH",
-        { draft: false },
+    const reconciled = runs.workflow_runs.find(
+      (run) =>
+        run.head_sha === c.sha &&
+        run.path === expectedPath &&
+        (run.status !== "completed" || run.conclusion === "success"),
+    );
+    if (reconciled) {
+      await this.options.store.db.run(
+        "UPDATE candidates SET publish_run_id=? WHERE id=?",
+        [String(reconciled.id), c.id],
       );
+      return reconciled;
     }
-    await db.run(
-      "UPDATE publications SET state='published',external_id=?,error=NULL WHERE candidate_id=? AND destination='github'",
-      [String(release.id), c.id],
-    );
-  }
-  private async downloadAssetDigest(gh: GitHub, repo: string, id: number) {
-    const response = await fetch(
-      `https://api.github.com/repos/${repo}/releases/assets/${id}`,
+    if (dispatchAt && Date.now() - Date.parse(dispatchAt) < 2 * 60 * 1000)
+      throw new RetryJobError(
+        "Waiting for publication workflow reconciliation",
+      );
+    if (c.publish_dispatch_attempts >= 3)
+      throw new Error(
+        "Publication workflow could not be reconciled after 3 dispatch attempts",
+      );
+    await fence();
+    await gh.request(
+      `/repos/${project.repo}/actions/workflows/${config.publish_workflow}/dispatches`,
+      "POST",
       {
-        headers: {
-          Authorization: `Bearer ${gh.token}`,
-          Accept: "application/octet-stream",
-          "User-Agent": "envol",
-          "X-GitHub-Api-Version": "2022-11-28",
+        ref: c.tag,
+        inputs: {
+          candidate_id: c.id,
+          tag: c.tag,
+          envol_url: this.options.url,
         },
       },
     );
-    if (!response.ok || !response.body)
-      throw new Error(
-        `Artifact verification download failed: ${response.status}`,
-      );
-    const hash = createHash("sha256");
-    for await (const chunk of response.body) hash.update(chunk);
-    return hash.digest("hex");
+    await this.options.store.db.run(
+      "UPDATE candidates SET publish_dispatch_at=?,publish_dispatch_attempts=publish_dispatch_attempts+1 WHERE id=?",
+      [now(), c.id],
+    );
+    await this.options.store.event(
+      c.id,
+      "publish_dispatch",
+      `Dispatched ${config.publish_workflow} for ${c.tag}`,
+    );
+    throw new RetryJobError("Publication workflow dispatched");
   }
   async cancel(id: string, fence: () => Promise<void>) {
     const { c, line, project, gh } = await this.context(id),
@@ -541,7 +560,78 @@ export class Engine {
     }
   }
 }
-export function bumpFile(path: string, contents: string, version: string) {
+export async function verifyPublication(
+  publisher: Publisher,
+  candidate: Candidate,
+  project: Project,
+  gh: GitHub,
+  artifacts: Artifact[],
+  fetcher: typeof fetch = fetch,
+) {
+  if (publisher === "github")
+    return verifyGitHubPublication(gh, project.repo, candidate.tag, artifacts);
+  return verifyCratesPublication(candidate.version, artifacts, fetcher);
+}
+
+export async function verifyGitHubPublication(
+  gh: GitHub,
+  repo: string,
+  tag: string,
+  artifacts: Artifact[],
+) {
+  const release = await gh.optional<{
+    id: number;
+    draft: boolean;
+    assets: { id: number; name: string; digest: string | null }[];
+  }>(`/repos/${repo}/releases/tags/${tag}`);
+  if (!release || release.draft)
+    throw new Error("GitHub release is missing or still a draft");
+  for (const artifact of artifacts) {
+    const asset = release.assets.find((item) => item.name === artifact.name);
+    if (!asset)
+      throw new Error(`GitHub release is missing asset ${artifact.name}`);
+    const digest =
+      asset.digest ??
+      `sha256:${createHash("sha256")
+        .update(await gh.releaseAsset(repo, asset.id))
+        .digest("hex")}`;
+    if (digest !== `sha256:${artifact.digest}`)
+      throw new Error(`GitHub release asset digest mismatch: ${artifact.name}`);
+  }
+  return String(release.id);
+}
+
+export async function verifyCratesPublication(
+  version: string,
+  artifacts: Artifact[],
+  fetcher: typeof fetch = fetch,
+) {
+  const suffix = `-${version}.crate`;
+  const packages = artifacts.filter((artifact) =>
+    artifact.name.endsWith(suffix),
+  );
+  if (packages.length !== 1)
+    throw new Error("Expected exactly one retained crate package");
+  const artifact = packages[0];
+  const crate = artifact.name.slice(0, -suffix.length);
+  const response = await fetcher(
+    `https://crates.io/api/v1/crates/${encodeURIComponent(crate)}/${encodeURIComponent(version)}`,
+    { headers: { Accept: "application/json", "User-Agent": "envol" } },
+  );
+  if (!response.ok)
+    throw new Error(`crates.io version is missing: ${crate}@${version}`);
+  const body = (await response.json()) as { version?: { checksum?: string } };
+  if (body.version?.checksum !== artifact.digest)
+    throw new Error(`crates.io package digest mismatch: ${artifact.name}`);
+  return `${crate}@${version}`;
+}
+
+export function bumpFile(
+  path: string,
+  contents: string,
+  version: string,
+  packageName?: string,
+) {
   if (path.endsWith("Cargo.toml")) {
     const doc = parse(contents) as Record<string, any>;
     const section =
@@ -553,12 +643,42 @@ export function bumpFile(path: string, contents: string, version: string) {
     if (!section) throw new Error(`No literal version in ${path}`);
     return replaceTomlVersion(contents, section, version, path);
   }
+  if (path.endsWith("Cargo.lock")) {
+    if (!packageName) throw new Error("Cargo.lock requires a package name");
+    return replaceCargoLockVersion(contents, packageName, version);
+  }
   if (path.endsWith("package.json")) {
     const doc = JSON.parse(contents);
     doc.version = version;
     return JSON.stringify(doc, null, 2) + "\n";
   }
+  if (path.endsWith("package-lock.json")) {
+    const doc = JSON.parse(contents);
+    doc.version = version;
+    if (doc.packages?.[""]) doc.packages[""].version = version;
+    return JSON.stringify(doc, null, 2) + "\n";
+  }
   throw new Error(`Unsupported version file: ${path}`);
+}
+
+function replaceCargoLockVersion(
+  contents: string,
+  packageName: string,
+  version: string,
+) {
+  const blocks = contents.split(/(?=\[\[package\]\])/);
+  const index = blocks.findIndex((block) => {
+    const name = block.match(/^name = "([^"]+)"$/m)?.[1];
+    return name === packageName;
+  });
+  if (index < 0) throw new Error(`No ${packageName} package in Cargo.lock`);
+  if (!/^version = "[^"]+"$/m.test(blocks[index]))
+    throw new Error(`No ${packageName} version in Cargo.lock`);
+  blocks[index] = blocks[index].replace(
+    /^version = "[^"]+"$/m,
+    `version = "${version}"`,
+  );
+  return blocks.join("");
 }
 
 function replaceTomlVersion(

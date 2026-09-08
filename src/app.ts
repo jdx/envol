@@ -9,6 +9,7 @@ import {
   type Artifact,
   type Candidate,
   type Line,
+  type Publisher,
   type Project,
 } from "./model.ts";
 import { Engine } from "./engine.ts";
@@ -272,7 +273,8 @@ export function app(services: Services) {
         [candidate.id],
       );
       if (!job) throw new RequestError("No failed job", 409);
-      await store.enqueue(candidate.id, job.kind);
+      if (!(await store.retry(candidate.id, job.kind)))
+        throw new RequestError("Job is already pending or running", 409);
     } else throw new RequestError("Unknown action");
     return c.json({ ok: true });
   });
@@ -393,15 +395,75 @@ export function app(services: Services) {
     // Reconciliation checks the actual workflow conclusion before marking ready.
     return c.json({ ok: true });
   });
-  api.get("/api/admin/candidates/:id/artifacts/:name", async (c) => {
+  // Publication workflows can download retained bytes and report outcomes, but their
+  // reports are informational. Only Envol's independent read-only checks publish rows.
+  api.use("/api/publish/:id/*", async (c, next) => {
+    const candidate = await store.candidate(c.req.param("id")!);
+    const token = c.req.header("Authorization")?.replace(/^Bearer /, "");
+    if (!token) return c.json({ error: "OIDC token required" }, 401);
+    const { payload } = await jwtVerify(token, jwks, {
+      issuer: "https://token.actions.githubusercontent.com",
+      audience: services.url,
+    });
+    const context = await engine().context(candidate.id);
+    if (
+      candidate.state !== "publishing" ||
+      payload.repository !== context.project.repo ||
+      payload.sha !== candidate.sha ||
+      payload.workflow_ref !== candidate.publish_workflow_ref ||
+      payload.event_name !== "workflow_dispatch" ||
+      typeof payload.run_id !== "string"
+    )
+      return c.json({ error: "Publication workflow identity mismatch" }, 403);
+    const run = await context.gh.request<{
+      head_sha: string;
+      event: string;
+    }>(`/repos/${context.project.repo}/actions/runs/${payload.run_id}`);
+    if (run.head_sha !== candidate.sha || run.event !== "workflow_dispatch")
+      return c.json({ error: "Publication run mismatch" }, 403);
+    const changed = await db.run(
+      "UPDATE candidates SET publish_run_id=? WHERE id=? AND (publish_run_id IS NULL OR publish_run_id=?)",
+      [payload.run_id, candidate.id, payload.run_id],
+    );
+    if (!changed)
+      return c.json(
+        { error: "Candidate already bound to another publication run" },
+        409,
+      );
+    await next();
+  });
+  api.get("/api/publish/:id/manifest", async (c) => {
+    const candidate = await store.candidate(c.req.param("id"));
+    const context = await engine().context(candidate.id);
+    const artifacts = await db.all<Artifact>(
+      "SELECT * FROM artifacts WHERE candidate_id=? ORDER BY name",
+      [candidate.id],
+    );
+    return c.json({
+      candidate: {
+        id: candidate.id,
+        version: candidate.version,
+        tag: candidate.tag,
+        sha: candidate.sha,
+      },
+      publishers: context.config.publishers,
+      artifacts: artifacts.map(({ name, digest, size }) => ({
+        name,
+        digest,
+        size,
+        download_url: `${services.url.replace(/\/$/, "")}/api/publish/${encodeURIComponent(candidate.id)}/artifacts/${encodeURIComponent(name)}`,
+      })),
+    });
+  });
+  const streamArtifact = async (candidateId: string, name: string) => {
     const artifact = await one<Artifact>(
       db,
       "SELECT * FROM artifacts WHERE candidate_id=? AND name=?",
-      [c.req.param("id"), c.req.param("name")],
+      [candidateId, name],
     );
-    if (!artifact) return c.notFound();
+    if (!artifact) return null;
     const object = await storage.get(artifact.storage_key);
-    if (!object) return c.notFound();
+    if (!object) return null;
     return new Response(object.body, {
       headers: {
         "Content-Type": "application/octet-stream",
@@ -409,6 +471,66 @@ export function app(services: Services) {
         "Content-Disposition": `attachment; filename="${artifact.name}"`,
       },
     });
+  };
+  api.get("/api/publish/:id/artifacts/:name", async (c) => {
+    return (
+      (await streamArtifact(c.req.param("id"), c.req.param("name"))) ??
+      c.notFound()
+    );
+  });
+  api.post("/api/publish/:id/report/:destination", async (c) => {
+    const id = c.req.param("id"),
+      destination = c.req.param("destination") as Publisher,
+      candidate = await store.candidate(id),
+      context = await engine().context(id);
+    if (
+      !["github", "crates"].includes(destination) ||
+      !context.config.publishers.includes(destination)
+    )
+      throw new RequestError("Publisher is not configured", 404);
+    if (candidate.state !== "publishing")
+      throw new RequestError("Candidate is not publishing", 409);
+    const body = await c.req.json<{
+      status?: string;
+      external_id?: string;
+      error?: string;
+    }>();
+    if (!["success", "failure"].includes(body.status ?? ""))
+      throw new RequestError("Report status must be success or failure");
+    if (
+      (body.external_id !== undefined &&
+        (typeof body.external_id !== "string" ||
+          body.external_id.length > 500)) ||
+      (body.error !== undefined &&
+        (typeof body.error !== "string" || body.error.length > 2000))
+    )
+      throw new RequestError("Publication report is too large");
+    const changed = await db.run(
+      "UPDATE publications SET state=?,external_id=?,error=? WHERE candidate_id=? AND destination=? AND state<>'published'",
+      [
+        body.status === "success" ? "reported" : "failed",
+        body.external_id ?? null,
+        body.status === "failure" ? (body.error ?? "Workflow failed") : null,
+        id,
+        destination,
+      ],
+    );
+    if (!changed) {
+      const publication = await one<{ state: string }>(
+        db,
+        "SELECT state FROM publications WHERE candidate_id=? AND destination=?",
+        [id, destination],
+      );
+      if (publication?.state === "published") return c.json({ ok: true });
+      throw new RequestError("Publication row is missing", 409);
+    }
+    return c.json({ ok: true });
+  });
+  api.get("/api/admin/candidates/:id/artifacts/:name", async (c) => {
+    return (
+      (await streamArtifact(c.req.param("id"), c.req.param("name"))) ??
+      c.notFound()
+    );
   });
   api.all("/api/*", (c) => c.json({ error: "Not found" }, 404));
   api.get("*", (c) =>

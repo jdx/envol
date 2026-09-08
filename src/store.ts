@@ -95,6 +95,26 @@ export class Store {
       [crypto.randomUUID(), id, kind, id, kind],
     );
   }
+  async retry(id: string, kind: string) {
+    const jobId = crypto.randomUUID();
+    await this.db.batch([
+      {
+        sql: "INSERT INTO jobs(id,candidate_id,kind) SELECT ?,?,? WHERE NOT EXISTS(SELECT 1 FROM jobs WHERE candidate_id=? AND kind=? AND state IN ('pending','running'))",
+        params: [jobId, id, kind, id, kind],
+      },
+      ...(kind === "promote"
+        ? [
+            {
+              sql: "UPDATE candidates SET publish_dispatch_at=NULL,publish_dispatch_attempts=0 WHERE id=? AND EXISTS(SELECT 1 FROM jobs WHERE id=?)",
+              params: [id, jobId],
+            },
+          ]
+        : []),
+    ]);
+    return Boolean(
+      await one(this.db, "SELECT 1 FROM jobs WHERE id=?", [jobId]),
+    );
+  }
   async claim() {
     const time = Date.now();
     const job = await one<{
@@ -104,8 +124,8 @@ export class Store {
       fence: number;
     }>(
       this.db,
-      "UPDATE jobs SET state='running',lease_until=?,fence=fence+1,attempts=attempts+1 WHERE id=(SELECT j.id FROM jobs j WHERE (j.state='pending' OR (j.state='running' AND j.lease_until<?)) AND NOT EXISTS(SELECT 1 FROM jobs busy WHERE busy.candidate_id=j.candidate_id AND busy.id<>j.id AND busy.state='running' AND busy.lease_until>=?) ORDER BY j.rowid LIMIT 1) RETURNING *",
-      [time + 240000, time, time],
+      "UPDATE jobs SET state='running',lease_until=?,fence=fence+1,attempts=attempts+1 WHERE id=(SELECT j.id FROM jobs j WHERE ((j.state='pending' AND j.lease_until<=?) OR (j.state='running' AND j.lease_until<?)) AND NOT EXISTS(SELECT 1 FROM jobs busy WHERE busy.candidate_id=j.candidate_id AND busy.id<>j.id AND busy.state='running' AND busy.lease_until>=?) ORDER BY j.rowid LIMIT 1) RETURNING *",
+      [time + 240000, time, time, time],
     );
     return job;
   }
@@ -114,6 +134,14 @@ export class Store {
       await this.db.run(
         "UPDATE jobs SET state=?,error=? WHERE id=? AND fence=?",
         [error ? "failed" : "done", error ?? null, id, fence],
+      ),
+    );
+  }
+  async defer(id: string, fence: number, delay = 15000) {
+    return Boolean(
+      await this.db.run(
+        "UPDATE jobs SET state='pending',lease_until=?,error=NULL WHERE id=? AND fence=? AND state='running'",
+        [Date.now() + delay, id, fence],
       ),
     );
   }

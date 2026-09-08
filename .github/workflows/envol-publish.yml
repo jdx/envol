@@ -1,0 +1,126 @@
+name: Envol publish
+run-name: Publish ${{ inputs.tag }}
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_id:
+        required: true
+        type: string
+      tag:
+        required: true
+        type: string
+      envol_url:
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      candidate_id:
+        required: true
+        type: string
+      tag:
+        required: true
+        type: string
+      envol_url:
+        required: true
+        type: string
+    secrets:
+      CARGO_REGISTRY_TOKEN:
+        required: false
+concurrency:
+  group: envol-publish-${{ inputs.candidate_id }}
+  cancel-in-progress: false
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      publishers: ${{ steps.artifacts.outputs.publishers }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag }}
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+      - id: artifacts
+        uses: ./.github/actions/envol-download
+        with:
+          envol-url: ${{ inputs.envol_url }}
+          candidate-id: ${{ inputs.candidate_id }}
+          download: "false"
+  github:
+    needs: plan
+    if: ${{ contains(fromJSON(needs.plan.outputs.publishers), 'github') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag }}
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+      - uses: ./.github/actions/envol-download
+        with:
+          envol-url: ${{ inputs.envol_url }}
+          candidate-id: ${{ inputs.candidate_id }}
+      - id: publish
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          ENVOL_TAG: ${{ inputs.tag }}
+        run: node scripts/publish-github.mjs
+      - name: Report result to Envol
+        if: ${{ always() }}
+        env:
+          ENVOL_URL: ${{ inputs.envol_url }}
+          ENVOL_CANDIDATE: ${{ inputs.candidate_id }}
+          ENVOL_DESTINATION: github
+          ENVOL_STATUS: ${{ job.status }}
+          ENVOL_EXTERNAL_ID: ${{ steps.publish.outputs.external_id }}
+          ENVOL_ERROR: GitHub release publication failed
+        run: node scripts/report-publication.mjs
+  crates:
+    needs: plan
+    if: ${{ contains(fromJSON(needs.plan.outputs.publishers), 'crates') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag }}
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+      - uses: ./.github/actions/envol-download
+        with:
+          envol-url: ${{ inputs.envol_url }}
+          candidate-id: ${{ inputs.candidate_id }}
+      - id: crates-auth
+        continue-on-error: true
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1
+      - id: publish
+        env:
+          CRATES_IO_TOKEN: ${{ steps.crates-auth.outputs.token || secrets.CARGO_REGISTRY_TOKEN }}
+        run: node scripts/publish-crates.mjs
+      - name: Report result to Envol
+        if: ${{ always() }}
+        env:
+          ENVOL_URL: ${{ inputs.envol_url }}
+          ENVOL_CANDIDATE: ${{ inputs.candidate_id }}
+          ENVOL_DESTINATION: crates
+          ENVOL_STATUS: ${{ job.status }}
+          ENVOL_EXTERNAL_ID: ${{ steps.publish.outputs.external_id }}
+          ENVOL_ERROR: crates.io publication failed
+        run: node scripts/report-publication.mjs

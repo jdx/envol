@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { readFile, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,18 +11,33 @@ import {
   configFromToml,
   releaseVersion,
   nextVersion,
+  type Artifact,
   type Line,
 } from "../src/model.ts";
 import { LocalStorage } from "../src/local-storage.ts";
-import { bumpFile, Engine } from "../src/engine.ts";
+import {
+  bumpFile,
+  Engine,
+  verifyCratesPublication,
+  verifyGitHubPublication,
+} from "../src/engine.ts";
 import { app, collectMetrics, githubForMetrics } from "../src/app.ts";
 import { GitHub } from "../src/github.ts";
 import { milestone } from "../src/metrics.ts";
 import { Miniflare, convertV4MiniflareOptions } from "miniflare";
-const schema = await readFile(
+const initialSchema = await readFile(
   new URL("../migrations/0001_initial.sql", import.meta.url),
   "utf8",
 );
+const publishWorkflowMigration = await readFile(
+  new URL("../migrations/0003_publish_workflow.sql", import.meta.url),
+  "utf8",
+);
+const publishAttemptsMigration = await readFile(
+  new URL("../migrations/0004_publish_dispatch_attempts.sql", import.meta.url),
+  "utf8",
+);
+const schema = `${initialSchema}\n${publishWorkflowMigration}\n${publishAttemptsMigration}`;
 const runtimeStateMigration = await readFile(
   new URL("../migrations/0002_runtime_state.sql", import.meta.url),
   "utf8",
@@ -61,6 +77,18 @@ async function exercise(db: Database) {
     (await db.all<{ state: string }>("SELECT state FROM jobs"))[0].state,
     "done",
   );
+  await db.run(
+    "INSERT INTO jobs(id,candidate_id,kind,state) VALUES('deferred',?,'test','pending')",
+    [first.id],
+  );
+  const deferred = await store.claim();
+  assert.ok(deferred);
+  assert.equal(await store.defer(deferred.id, deferred.fence, 60_000), true);
+  assert.equal(await store.claim(), undefined);
+  await db.run("UPDATE jobs SET lease_until=0 WHERE id='deferred'");
+  const reclaimed = await store.claim();
+  assert.equal(reclaimed?.id, "deferred");
+  assert.equal(await store.finish(reclaimed!.id, reclaimed!.fence), true);
   const preparing = await store.transition(first, "preparing");
   await assert.rejects(
     () => store.transition(first, "cancelling"),
@@ -159,12 +187,142 @@ test("configuration validates paths, release lines and exact artifact inventory"
     new URL("../envol.toml", import.meta.url),
     "utf8",
   );
-  assert.equal(configFromToml(source).lines.stable.branch, "main");
+  const config = configFromToml(source);
+  assert.equal(config.lines.stable.branch, "main");
+  assert.equal(config.publish_workflow, "envol-publish.yml");
+  assert.deepEqual(config.publishers, ["github", "crates"]);
+  assert.equal(config.cargo_package, "envol");
   assert.throws(() =>
     configFromToml(source.replace('"Cargo.toml"', '"../Cargo.toml"')),
   );
   assert.throws(() =>
     configFromToml(source + '\n[lines.other]\nbranch="main"\nchannel="beta"'),
+  );
+  assert.throws(() => configFromToml(source.replace('"crates"', '"npm"')));
+  assert.throws(() =>
+    configFromToml(
+      source.replace('cargo_package = "envol"', 'cargo_package = "../envol"'),
+    ),
+  );
+  assert.throws(() =>
+    configFromToml(
+      source.replace('["github", "crates"]', '["github", "github"]'),
+    ),
+  );
+});
+
+const retainedArtifacts: Artifact[] = [
+  {
+    candidate_id: "candidate",
+    name: "envol-linux-x64.tar.gz",
+    digest: "a".repeat(64),
+    size: 12,
+    storage_key: "artifact",
+  },
+  {
+    candidate_id: "candidate",
+    name: "envol-1.0.0.crate",
+    digest: "b".repeat(64),
+    size: 34,
+    storage_key: "crate",
+  },
+];
+
+test("GitHub publication verification requires every retained asset digest", async () => {
+  class ReleaseGitHub extends GitHub {
+    constructor(
+      private readonly assets: {
+        id: number;
+        name: string;
+        digest: string | null;
+      }[],
+      private readonly downloaded = new Map<number, Uint8Array>(),
+    ) {
+      super("read-only");
+    }
+    override async optional<T>(): Promise<T> {
+      return { id: 42, draft: false, assets: this.assets } as T;
+    }
+    override async releaseAsset(_repo: string, id: number) {
+      const bytes = this.downloaded.get(id);
+      if (!bytes) throw new Error(`Missing test asset ${id}`);
+      return bytes;
+    }
+  }
+  const valid = retainedArtifacts.map((artifact, index) => ({
+    id: index + 1,
+    name: artifact.name,
+    digest: `sha256:${artifact.digest}`,
+  }));
+  assert.equal(
+    await verifyGitHubPublication(
+      new ReleaseGitHub(valid),
+      "owner/repo",
+      "v1.0.0",
+      retainedArtifacts,
+    ),
+    "42",
+  );
+  await assert.rejects(
+    () =>
+      verifyGitHubPublication(
+        new ReleaseGitHub(valid.slice(0, 1)),
+        "owner/repo",
+        "v1.0.0",
+        retainedArtifacts,
+      ),
+    /missing asset envol-1.0.0.crate/,
+  );
+  await assert.rejects(
+    () =>
+      verifyGitHubPublication(
+        new ReleaseGitHub([
+          { ...valid[0], digest: `sha256:${"c".repeat(64)}` },
+          valid[1],
+        ]),
+        "owner/repo",
+        "v1.0.0",
+        retainedArtifacts,
+      ),
+    /digest mismatch/,
+  );
+  const bytes = new TextEncoder().encode("retained bytes");
+  const digest = createHash("sha256").update(bytes).digest("hex");
+  assert.equal(
+    await verifyGitHubPublication(
+      new ReleaseGitHub(
+        [{ id: 7, name: "asset", digest: null }],
+        new Map([[7, bytes]]),
+      ),
+      "owner/repo",
+      "v1.0.0",
+      [
+        {
+          candidate_id: "candidate",
+          name: "asset",
+          digest,
+          size: bytes.length,
+          storage_key: "asset",
+        },
+      ],
+    ),
+    "42",
+  );
+});
+
+test("crates.io verification checks the retained package checksum", async () => {
+  const fetcher: typeof fetch = async () =>
+    Response.json({ version: { checksum: "b".repeat(64) } });
+  assert.equal(
+    await verifyCratesPublication("1.0.0", retainedArtifacts, fetcher),
+    "envol@1.0.0",
+  );
+  await assert.rejects(
+    () =>
+      verifyCratesPublication("1.0.0", retainedArtifacts, async () =>
+        Response.json({ version: { checksum: "c".repeat(64) } }),
+      ),
+    /digest mismatch/,
   );
 });
 test("version edits support Cargo workspaces and package.json", () => {
@@ -182,6 +340,24 @@ test("version edits support Cargo workspaces and package.json", () => {
   assert.throws(() =>
     bumpFile("Cargo.toml", '[package]\nname="test"', "2.0.0"),
   );
+  assert.equal(
+    bumpFile(
+      "Cargo.lock",
+      'version = 4\n\n[[package]]\nname = "envol"\nversion = "1.0.0"\n\n[[package]]\nname = "other"\nversion = "1.0.0"\n',
+      "2.0.0",
+      "envol",
+    ),
+    'version = 4\n\n[[package]]\nname = "envol"\nversion = "2.0.0"\n\n[[package]]\nname = "other"\nversion = "1.0.0"\n',
+  );
+  const packageLock = JSON.parse(
+    bumpFile(
+      "package-lock.json",
+      '{"version":"1.0.0","packages":{"":{"version":"1.0.0"}}}',
+      "2.0.0",
+    ),
+  );
+  assert.equal(packageLock.version, "2.0.0");
+  assert.equal(packageLock.packages[""].version, "2.0.0");
 });
 
 test("milestones use the nearest point before the trailing cutoff", () => {
@@ -454,6 +630,84 @@ test("a successful retry clears the candidate's previous error", async () => {
     });
     assert.equal(await engine.runOne(), true);
     assert.equal((await store.candidate(candidate.id)).error, null);
+  } finally {
+    db.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("an operator retry resets the publication dispatch budget", async () => {
+  const db = new SQLiteStore(":memory:");
+  const dir = await mkdtemp(join(tmpdir(), "envol-dispatch-retry-"));
+  try {
+    db.raw.exec(schema);
+    await db.run("INSERT INTO projects VALUES(?,?,?,?,?,?)", [
+      "p",
+      "owner/repo",
+      1,
+      0,
+      "{}",
+      "now",
+    ]);
+    await db.run(
+      "INSERT INTO lines(id,project_id,name,branch,channel) VALUES(?,?,?,?,?)",
+      ["l", "p", "stable", "main", "stable"],
+    );
+    const store = new Store(db);
+    const line = (await db.all<Line>("SELECT * FROM lines"))[0];
+    const candidate = await store.create(line, "1.0.0", "retry-dispatch");
+    await db.run(
+      "UPDATE candidates SET state='publishing',publish_dispatch_at='2026-01-01T00:00:00Z',publish_dispatch_attempts=3 WHERE id=?",
+      [candidate.id],
+    );
+    await db.run(
+      "UPDATE jobs SET kind='promote',state='failed' WHERE candidate_id=?",
+      [candidate.id],
+    );
+    const api = app({
+      store,
+      storage: new LocalStorage(dir),
+      adminToken: "secret-token",
+      url: "https://envol.test",
+    });
+    const response = await api.request(
+      `/api/admin/candidates/${candidate.id}/retry`,
+      {
+        method: "POST",
+        headers: { Authorization: "Bearer secret-token" },
+      },
+    );
+    assert.equal(response.status, 200);
+    const retried = await store.candidate(candidate.id);
+    assert.equal(retried.publish_dispatch_at, null);
+    assert.equal(retried.publish_dispatch_attempts, 0);
+    await db.run(
+      "UPDATE candidates SET publish_dispatch_at='2026-02-01T00:00:00Z',publish_dispatch_attempts=2 WHERE id=?",
+      [candidate.id],
+    );
+    const duplicate = await api.request(
+      `/api/admin/candidates/${candidate.id}/retry`,
+      {
+        method: "POST",
+        headers: { Authorization: "Bearer secret-token" },
+      },
+    );
+    assert.equal(duplicate.status, 409);
+    const unchanged = await store.candidate(candidate.id);
+    assert.equal(unchanged.publish_dispatch_at, "2026-02-01T00:00:00Z");
+    assert.equal(unchanged.publish_dispatch_attempts, 2);
+    assert.deepEqual(
+      (
+        await db.all<{ kind: string; state: string }>(
+          "SELECT kind,state FROM jobs WHERE candidate_id=? ORDER BY rowid",
+          [candidate.id],
+        )
+      ).map(({ kind, state }) => ({ kind, state })),
+      [
+        { kind: "promote", state: "failed" },
+        { kind: "promote", state: "pending" },
+      ],
+    );
   } finally {
     db.close();
     await rm(dir, { recursive: true, force: true });

@@ -69,6 +69,28 @@ export class GitHub {
       throw e;
     }
   }
+  async releaseAsset(
+    repo: string,
+    id: number,
+  ): Promise<Uint8Array<ArrayBufferLike>> {
+    const response = await fetch(
+      `https://api.github.com/repos/${repo}/releases/assets/${id}`,
+      {
+        headers: {
+          ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}),
+          Accept: "application/octet-stream",
+          "User-Agent": "envol",
+          "X-GitHub-Api-Version": "2022-11-28",
+        },
+      },
+    );
+    if (!response.ok)
+      throw new GitHubError(
+        response.status,
+        `GET release asset ${id}: GitHub ${response.status}`,
+      );
+    return new Uint8Array(await response.arrayBuffer());
+  }
   async head(repo: string, branch: string) {
     return (
       await this.request<{ object: { sha: string } }>(

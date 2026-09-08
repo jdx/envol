@@ -1,4 +1,4 @@
-import { mkdir, readFile } from "node:fs/promises";
+import { mkdir, readFile, readdir } from "node:fs/promises";
 import { resolve } from "node:path";
 import { serve } from "@hono/node-server";
 import { serveStatic } from "@hono/node-server/serve-static";
@@ -12,11 +12,45 @@ const dir = resolve(process.env.ENVOL_DATA_DIR ?? "data");
 await mkdir(dir, { recursive: true });
 const db = new SQLiteStore(resolve(dir, "envol.sqlite"));
 db.raw.exec(
-  await readFile(
-    new URL("../migrations/0001_initial.sql", import.meta.url),
-    "utf8",
-  ),
+  "CREATE TABLE IF NOT EXISTS schema_migrations (name TEXT PRIMARY KEY, applied_at TEXT NOT NULL)",
 );
+const migrations = (await readdir(new URL("../migrations/", import.meta.url)))
+  .filter((name) => name.endsWith(".sql"))
+  .sort();
+for (const name of migrations) {
+  if (db.raw.prepare("SELECT 1 FROM schema_migrations WHERE name=?").get(name))
+    continue;
+  let sql = await readFile(
+    new URL(`../migrations/${name}`, import.meta.url),
+    "utf8",
+  );
+  if (name === "0003_publish_workflow.sql") {
+    const columns = new Set(
+      db.raw
+        .prepare("PRAGMA table_info(candidates)")
+        .all()
+        .map((column) => (column as { name: string }).name),
+    );
+    sql = sql
+      .split("\n")
+      .filter((statement) => {
+        const column = statement.match(/ADD COLUMN (\w+)/)?.[1];
+        return !column || !columns.has(column);
+      })
+      .join("\n");
+  }
+  db.raw.exec("BEGIN");
+  try {
+    db.raw.exec(sql);
+    db.raw
+      .prepare("INSERT INTO schema_migrations VALUES(?,?)")
+      .run(name, new Date().toISOString());
+    db.raw.exec("COMMIT");
+  } catch (error) {
+    db.raw.exec("ROLLBACK");
+    throw error;
+  }
+}
 const staticApp = new Hono()
   .use("*", serveStatic({ root: "./dist" }))
   .get("*", serveStatic({ path: "./dist/index.html" }));

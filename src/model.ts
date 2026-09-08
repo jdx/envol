@@ -45,6 +45,7 @@ export interface Candidate {
   publish_run_id: string | null;
   publish_workflow_ref: string | null;
   publish_dispatch_at: string | null;
+  publish_dispatch_attempts: number;
   error: string | null;
   revision: number;
   frozen: number;

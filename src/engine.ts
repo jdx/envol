@@ -398,25 +398,11 @@ export class Engine {
       throw new RetryJobError(
         "Waiting for publication workflow reconciliation",
       );
-    const dispatches = await one<{ count: number }>(
-      this.options.store.db,
-      "SELECT COUNT(*) AS count FROM events WHERE candidate_id=? AND kind='publish_dispatch'",
-      [c.id],
-    );
-    if ((dispatches?.count ?? 0) >= 3)
+    if (c.publish_dispatch_attempts >= 3)
       throw new Error(
         "Publication workflow could not be reconciled after 3 dispatch attempts",
       );
     await fence();
-    await this.options.store.db.run(
-      "UPDATE candidates SET publish_dispatch_at=? WHERE id=?",
-      [now(), c.id],
-    );
-    await this.options.store.event(
-      c.id,
-      "publish_dispatch",
-      `Dispatching ${config.publish_workflow} for ${c.tag}`,
-    );
     await gh.request(
       `/repos/${project.repo}/actions/workflows/${config.publish_workflow}/dispatches`,
       "POST",
@@ -428,6 +414,15 @@ export class Engine {
           envol_url: this.options.url,
         },
       },
+    );
+    await this.options.store.db.run(
+      "UPDATE candidates SET publish_dispatch_at=?,publish_dispatch_attempts=publish_dispatch_attempts+1 WHERE id=?",
+      [now(), c.id],
+    );
+    await this.options.store.event(
+      c.id,
+      "publish_dispatch",
+      `Dispatched ${config.publish_workflow} for ${c.tag}`,
     );
     throw new RetryJobError("Publication workflow dispatched");
   }

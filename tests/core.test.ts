@@ -33,7 +33,11 @@ const publishWorkflowMigration = await readFile(
   new URL("../migrations/0003_publish_workflow.sql", import.meta.url),
   "utf8",
 );
-const schema = `${initialSchema}\n${publishWorkflowMigration}`;
+const publishAttemptsMigration = await readFile(
+  new URL("../migrations/0004_publish_dispatch_attempts.sql", import.meta.url),
+  "utf8",
+);
+const schema = `${initialSchema}\n${publishWorkflowMigration}\n${publishAttemptsMigration}`;
 const runtimeStateMigration = await readFile(
   new URL("../migrations/0002_runtime_state.sql", import.meta.url),
   "utf8",
@@ -620,6 +624,69 @@ test("a successful retry clears the candidate's previous error", async () => {
     });
     assert.equal(await engine.runOne(), true);
     assert.equal((await store.candidate(candidate.id)).error, null);
+  } finally {
+    db.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("an operator retry resets the publication dispatch budget", async () => {
+  const db = new SQLiteStore(":memory:");
+  const dir = await mkdtemp(join(tmpdir(), "envol-dispatch-retry-"));
+  try {
+    db.raw.exec(schema);
+    await db.run("INSERT INTO projects VALUES(?,?,?,?,?,?)", [
+      "p",
+      "owner/repo",
+      1,
+      0,
+      "{}",
+      "now",
+    ]);
+    await db.run(
+      "INSERT INTO lines(id,project_id,name,branch,channel) VALUES(?,?,?,?,?)",
+      ["l", "p", "stable", "main", "stable"],
+    );
+    const store = new Store(db);
+    const line = (await db.all<Line>("SELECT * FROM lines"))[0];
+    const candidate = await store.create(line, "1.0.0", "retry-dispatch");
+    await db.run(
+      "UPDATE candidates SET state='publishing',publish_dispatch_at='2026-01-01T00:00:00Z',publish_dispatch_attempts=3 WHERE id=?",
+      [candidate.id],
+    );
+    await db.run(
+      "UPDATE jobs SET kind='promote',state='failed' WHERE candidate_id=?",
+      [candidate.id],
+    );
+    const api = app({
+      store,
+      storage: new LocalStorage(dir),
+      adminToken: "secret-token",
+      url: "https://envol.test",
+    });
+    const response = await api.request(
+      `/api/admin/candidates/${candidate.id}/retry`,
+      {
+        method: "POST",
+        headers: { Authorization: "Bearer secret-token" },
+      },
+    );
+    assert.equal(response.status, 200);
+    const retried = await store.candidate(candidate.id);
+    assert.equal(retried.publish_dispatch_at, null);
+    assert.equal(retried.publish_dispatch_attempts, 0);
+    assert.deepEqual(
+      (
+        await db.all<{ kind: string; state: string }>(
+          "SELECT kind,state FROM jobs WHERE candidate_id=? ORDER BY rowid",
+          [candidate.id],
+        )
+      ).map(({ kind, state }) => ({ kind, state })),
+      [
+        { kind: "promote", state: "failed" },
+        { kind: "promote", state: "pending" },
+      ],
+    );
   } finally {
     db.close();
     await rm(dir, { recursive: true, force: true });

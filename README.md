@@ -65,8 +65,11 @@ cargo run --locked -- check
 ```
 
 Database contract tests run against both Node SQLite and Miniflare D1. The CI
-`final` job requires every formatting, application, and CLI job to succeed;
-failed or unexpectedly skipped jobs cannot produce a successful gate.
+`final` job requires every formatting, application, CLI, and zizmor job to
+succeed; failed or unexpectedly skipped jobs cannot produce a successful gate.
+The crate's `rust-version = "1.91"` remains Cargo compatibility metadata; CI
+intentionally uses the Rust toolchain already installed on the runner rather
+than installing and maintaining a separate MSRV toolchain.
 
 ## Hosted deployment
 

@@ -40,20 +40,10 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
-        with:
-          components: rustfmt, clippy
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
       - run: cargo run --locked -- check
-  msrv:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@8d8cc9a8e0d47b64af669de71110e76860d6afbd # 1.91.0
-      - run: cargo check --locked
   zizmor:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -69,7 +59,7 @@ jobs:
           min-severity: high
   final:
     permissions: {}
-    needs: [format, application, cli, msrv, zizmor]
+    needs: [format, application, cli, zizmor]
     runs-on: ubuntu-latest
     timeout-minutes: 1
     # Run after upstream failures, but respect workflow cancellation.

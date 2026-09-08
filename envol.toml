@@ -1,6 +1,7 @@
 workflow = "envol.yml"
 publish_workflow = "envol-publish.yml"
 publishers = ["github", "crates"]
+cargo_package = "envol"
 version_files = ["Cargo.toml", "Cargo.lock", "package.json", "package-lock.json"]
 required_artifacts = ["envol-linux-x64.tar.gz"]
 auto_promote = false

@@ -64,6 +64,7 @@ export interface Config {
   workflow: string;
   publish_workflow: string;
   publishers: Publisher[];
+  cargo_package?: string;
   version_files: string[];
   required_artifacts: string[];
   auto_promote: boolean;
@@ -79,6 +80,7 @@ export function configFromToml(text: string): Config {
   const workflow = raw.workflow ?? "envol.yml";
   const publish_workflow = raw.publish_workflow ?? "envol-publish.yml";
   const publishers = raw.publishers ?? ["github"];
+  const cargo_package = raw.cargo_package;
   const version_files = raw.version_files ?? ["Cargo.toml"];
   const required_artifacts = raw.required_artifacts;
   const lines = raw.lines;
@@ -98,6 +100,11 @@ export function configFromToml(text: string): Config {
     throw new RequestError(
       "publishers must be a unique list containing github and/or crates",
     );
+  if (
+    cargo_package !== undefined &&
+    (typeof cargo_package !== "string" || !/^[\w-]+$/.test(cargo_package))
+  )
+    throw new RequestError("cargo_package must be a Cargo package name");
   if (
     !Array.isArray(version_files) ||
     !version_files.length ||
@@ -147,6 +154,7 @@ export function configFromToml(text: string): Config {
     workflow,
     publish_workflow,
     publishers: publishers as Publisher[],
+    cargo_package: cargo_package as string | undefined,
     version_files: version_files as string[],
     required_artifacts: required_artifacts as string[],
     auto_promote: raw.auto_promote === true,

@@ -36,6 +36,9 @@ Publishing is preferred; `CARGO_REGISTRY_TOKEN` is an optional fallback reposito
 secret. Envol itself neither receives these credentials nor writes releases or
 registry packages.
 
+Set `cargo_package` when `version_files` contains `Cargo.lock` and the released
+package name cannot be read from one of the listed Cargo manifests.
+
 ## Local development
 
 ```sh

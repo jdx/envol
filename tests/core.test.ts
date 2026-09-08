@@ -191,6 +191,7 @@ test("configuration validates paths, release lines and exact artifact inventory"
   assert.equal(config.lines.stable.branch, "main");
   assert.equal(config.publish_workflow, "envol-publish.yml");
   assert.deepEqual(config.publishers, ["github", "crates"]);
+  assert.equal(config.cargo_package, "envol");
   assert.throws(() =>
     configFromToml(source.replace('"Cargo.toml"', '"../Cargo.toml"')),
   );
@@ -198,6 +199,11 @@ test("configuration validates paths, release lines and exact artifact inventory"
     configFromToml(source + '\n[lines.other]\nbranch="main"\nchannel="beta"'),
   );
   assert.throws(() => configFromToml(source.replace('"crates"', '"npm"')));
+  assert.throws(() =>
+    configFromToml(
+      source.replace('cargo_package = "envol"', 'cargo_package = "../envol"'),
+    ),
+  );
   assert.throws(() =>
     configFromToml(
       source.replace('["github", "crates"]', '["github", "github"]'),

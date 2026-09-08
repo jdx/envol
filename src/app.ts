@@ -515,7 +515,15 @@ export function app(services: Services) {
         destination,
       ],
     );
-    if (!changed) throw new RequestError("Publication row is missing", 409);
+    if (!changed) {
+      const publication = await one<{ state: string }>(
+        db,
+        "SELECT state FROM publications WHERE candidate_id=? AND destination=?",
+        [id, destination],
+      );
+      if (publication?.state === "published") return c.json({ ok: true });
+      throw new RequestError("Publication row is missing", 409);
+    }
     return c.json({ ok: true });
   });
   api.get("/api/admin/candidates/:id/artifacts/:name", async (c) => {

@@ -104,8 +104,14 @@ export async function publishGitHubRelease({ token, repo, tag, directory }) {
     if (
       (await remoteDigest(token, repo, uploaded)) !==
       `sha256:${artifact.digest}`
-    )
+    ) {
+      await github(
+        token,
+        `/repos/${repo}/releases/assets/${uploaded.id}`,
+        "DELETE",
+      );
       throw new Error(`Uploaded asset digest mismatch: ${name}`);
+    }
     release.assets.push(uploaded);
   }
   for (const artifact of manifest.artifacts)

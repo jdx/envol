@@ -95,6 +95,16 @@ fn main() -> Result<()> {
                 }
             }
         }
+        if let Some(package) = doc.get("cargo_package") {
+            let package = package.as_str().context("cargo_package must be a string")?;
+            if package.is_empty()
+                || !package.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+                })
+            {
+                bail!("cargo_package must be a Cargo package name");
+            }
+        }
         println!("{}: configuration syntax is valid", file.display());
         return Ok(());
     }

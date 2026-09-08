@@ -154,19 +154,22 @@ export class Engine {
       );
       if (existing) sha = existing.object.sha;
       else {
-        const files = [];
-        for (const path of config.version_files) {
-          const contents = await gh.file(project.repo, path, base);
-          files.push({
+        const sourceFiles = await Promise.all(
+          config.version_files.map(async (path) => ({
             path,
-            content: bumpFile(
-              path,
-              contents,
-              c.version,
-              project.repo.split("/")[1],
-            ),
-          });
-        }
+            contents: await gh.file(project.repo, path, base),
+          })),
+        );
+        const manifestPackage = sourceFiles
+          .filter(({ path }) => path.endsWith("Cargo.toml"))
+          .map(({ contents }) => parse(contents) as Record<string, any>)
+          .map((manifest) => manifest.package?.name)
+          .find((name): name is string => typeof name === "string");
+        const cargoPackage = config.cargo_package ?? manifestPackage;
+        const files = sourceFiles.map(({ path, contents }) => ({
+          path,
+          content: bumpFile(path, contents, c.version, cargoPackage),
+        }));
         let prior = "";
         try {
           prior = await gh.file(project.repo, "CHANGELOG.md", base);

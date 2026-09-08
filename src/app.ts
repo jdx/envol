@@ -273,12 +273,8 @@ export function app(services: Services) {
         [candidate.id],
       );
       if (!job) throw new RequestError("No failed job", 409);
-      if (job.kind === "promote")
-        await db.run(
-          "UPDATE candidates SET publish_dispatch_at=NULL,publish_dispatch_attempts=0 WHERE id=?",
-          [candidate.id],
-        );
-      await store.enqueue(candidate.id, job.kind);
+      if (!(await store.retry(candidate.id, job.kind)))
+        throw new RequestError("Job is already pending or running", 409);
     } else throw new RequestError("Unknown action");
     return c.json({ ok: true });
   });

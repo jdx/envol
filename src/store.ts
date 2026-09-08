@@ -95,6 +95,26 @@ export class Store {
       [crypto.randomUUID(), id, kind, id, kind],
     );
   }
+  async retry(id: string, kind: string) {
+    const jobId = crypto.randomUUID();
+    await this.db.batch([
+      {
+        sql: "INSERT INTO jobs(id,candidate_id,kind) SELECT ?,?,? WHERE NOT EXISTS(SELECT 1 FROM jobs WHERE candidate_id=? AND kind=? AND state IN ('pending','running'))",
+        params: [jobId, id, kind, id, kind],
+      },
+      ...(kind === "promote"
+        ? [
+            {
+              sql: "UPDATE candidates SET publish_dispatch_at=NULL,publish_dispatch_attempts=0 WHERE id=? AND EXISTS(SELECT 1 FROM jobs WHERE id=?)",
+              params: [id, jobId],
+            },
+          ]
+        : []),
+    ]);
+    return Boolean(
+      await one(this.db, "SELECT 1 FROM jobs WHERE id=?", [jobId]),
+    );
+  }
   async claim() {
     const time = Date.now();
     const job = await one<{

@@ -675,6 +675,21 @@ test("an operator retry resets the publication dispatch budget", async () => {
     const retried = await store.candidate(candidate.id);
     assert.equal(retried.publish_dispatch_at, null);
     assert.equal(retried.publish_dispatch_attempts, 0);
+    await db.run(
+      "UPDATE candidates SET publish_dispatch_at='2026-02-01T00:00:00Z',publish_dispatch_attempts=2 WHERE id=?",
+      [candidate.id],
+    );
+    const duplicate = await api.request(
+      `/api/admin/candidates/${candidate.id}/retry`,
+      {
+        method: "POST",
+        headers: { Authorization: "Bearer secret-token" },
+      },
+    );
+    assert.equal(duplicate.status, 409);
+    const unchanged = await store.candidate(candidate.id);
+    assert.equal(unchanged.publish_dispatch_at, "2026-02-01T00:00:00Z");
+    assert.equal(unchanged.publish_dispatch_attempts, 2);
     assert.deepEqual(
       (
         await db.all<{ kind: string; state: string }>(

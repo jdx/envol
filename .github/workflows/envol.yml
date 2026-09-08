@@ -27,12 +27,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: npm ci && npm run check && npm test && npm run build
       - run: cargo test --locked && cargo build --release --locked
+      - run: cargo package --locked
       - name: Test the release binary and prepare artifact
         run: |
           target/release/envol --version
           target/release/envol check
           mkdir -p dist-release
           tar -czf dist-release/envol-linux-x64.tar.gz -C target/release envol
+          packages=(target/package/envol-*.crate)
+          test "${#packages[@]}" -eq 1
+          cp "${packages[0]}" dist-release/
       - name: Retain artifact and report validation
         env:
           ENVOL_URL: ${{ inputs.envol_url }}

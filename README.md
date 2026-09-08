@@ -1,7 +1,8 @@
 # Envol
 
 A release control plane for CLIs: prepare a candidate, build and test it once,
-then promote the exact tested commit and publish the retained artifacts.
+then promote the exact tested commit and coordinate publication of the retained
+artifacts from the project's own GitHub Actions workflow.
 
 > [!WARNING]
 > **Work in progress:** Envol is an early implementation and has not yet been
@@ -15,13 +16,24 @@ then promote the exact tested commit and publish the retained artifacts.
 - Node.js 24, SQLite, and local artifact storage for self-hosting.
 - Rust CLI in `crates/envol` for configuring and operating releases.
 - The Rust CLI uses the compiled `usage-rs` parser built on portable usage specs.
-- GitHub Actions runners build candidates; GitHub OIDC authenticates artifact uploads.
+- GitHub Actions runners build candidates and publish them; GitHub OIDC authenticates
+  artifact transfers and informational publication reports to Envol.
 
 The intended release sequence freezes the source branch with a dedicated GitHub
 ruleset, prepares an immutable candidate commit and PR, runs checks and uploads
 artifacts, fast-forwards the source branch to the tested commit, creates the tag,
-unfreezes the branch, and publishes retained artifacts. Publication is resumable.
-Release lines configure stable, next-major prerelease, and maintenance branches.
+and unfreezes the branch. Envol then dispatches `envol-publish.yml` at that exact
+tag. The repository workflow downloads and verifies the retained bytes before
+publishing with credentials held only by GitHub. Envol independently verifies the
+external release with read-only APIs before recording it as published. Publication
+is resumable. Release lines configure stable, next-major prerelease, and maintenance
+branches.
+
+`envol.toml` selects `publishers = ["github"]` by default. Add `"crates"` to
+publish the exact `.crate` produced by the candidate workflow. crates.io Trusted
+Publishing is preferred; `CARGO_REGISTRY_TOKEN` is an optional fallback repository
+secret. Envol itself neither receives these credentials nor writes releases or
+registry packages.
 
 ## Local development
 
@@ -62,12 +74,18 @@ own account. Initial custom-domain setup is separate; CI does not need DNS acces
 
 ## Current limits
 
-- GitHub release publication is implemented; crates.io and other registry
-  publishers are not yet implemented.
+- The supplied publication workflow supports GitHub Releases and one retained
+  crates.io package per candidate. Other registries need destination jobs and
+  independent verification adapters.
+- Cargo lockfile version updates currently assume the released crate has the same
+  name as the repository; multi-crate workspaces need explicit package selection.
+- GitHub's release API must expose asset SHA-256 digests, and crates.io must expose
+  the published package checksum, before Envol will mark those destinations as
+  published. Workflow reports alone never advance release state.
 - Administration currently uses a shared token, not GitHub login or per-user ACLs.
-- Candidate version editing does not yet synchronize package lockfiles.
-- GitHub branch rules, PR readiness under a freeze, cancellation recovery, and
-  publication retries need live pilot validation before production use.
+- GitHub branch rules, PR readiness under a freeze, cancellation recovery,
+  publication-workflow retries, Trusted Publishing, and registry propagation delays
+  need live pilot validation before production use.
 - Analytics collection and historical import helpers are preliminary; the full
   public popularity and milestones experience is not yet connected.
 

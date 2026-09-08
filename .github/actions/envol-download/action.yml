@@ -1,0 +1,25 @@
+name: Download verified Envol artifacts
+description: Authenticate with Envol, download retained candidate artifacts, and verify their digests
+inputs:
+  envol-url:
+    required: true
+  candidate-id:
+    required: true
+  download:
+    required: false
+    default: "true"
+outputs:
+  publishers:
+    value: ${{ steps.download.outputs.publishers }}
+  version:
+    value: ${{ steps.download.outputs.version }}
+runs:
+  using: composite
+  steps:
+    - id: download
+      shell: bash
+      env:
+        ENVOL_URL: ${{ inputs.envol-url }}
+        ENVOL_CANDIDATE: ${{ inputs.candidate-id }}
+        ENVOL_DOWNLOAD: ${{ inputs.download }}
+      run: node "$GITHUB_ACTION_PATH/download.mjs"

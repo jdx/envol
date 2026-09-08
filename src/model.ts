@@ -42,12 +42,16 @@ export interface Candidate {
   pr: number | null;
   run_id: string | null;
   workflow_ref: string | null;
+  publish_run_id: string | null;
+  publish_workflow_ref: string | null;
+  publish_dispatch_at: string | null;
   error: string | null;
   revision: number;
   frozen: number;
   created_at: string;
   updated_at: string;
 }
+export type Publisher = "github" | "crates";
 export interface Artifact {
   candidate_id: string;
   name: string;
@@ -57,6 +61,8 @@ export interface Artifact {
 }
 export interface Config {
   workflow: string;
+  publish_workflow: string;
+  publishers: Publisher[];
   version_files: string[];
   required_artifacts: string[];
   auto_promote: boolean;
@@ -70,11 +76,27 @@ export function configFromToml(text: string): Config {
     throw new RequestError("Invalid project configuration");
   }
   const workflow = raw.workflow ?? "envol.yml";
+  const publish_workflow = raw.publish_workflow ?? "envol-publish.yml";
+  const publishers = raw.publishers ?? ["github"];
   const version_files = raw.version_files ?? ["Cargo.toml"];
   const required_artifacts = raw.required_artifacts;
   const lines = raw.lines;
   if (typeof workflow !== "string" || !/^[-\w.]+\.ya?ml$/.test(workflow))
     throw new RequestError("workflow must be a YAML filename");
+  if (
+    typeof publish_workflow !== "string" ||
+    !/^[-\w.]+\.ya?ml$/.test(publish_workflow)
+  )
+    throw new RequestError("publish_workflow must be a YAML filename");
+  if (
+    !Array.isArray(publishers) ||
+    !publishers.length ||
+    publishers.some((publisher) => !["github", "crates"].includes(publisher)) ||
+    new Set(publishers).size !== publishers.length
+  )
+    throw new RequestError(
+      "publishers must be a unique list containing github and/or crates",
+    );
   if (
     !Array.isArray(version_files) ||
     !version_files.length ||
@@ -122,6 +144,8 @@ export function configFromToml(text: string): Config {
   }
   return {
     workflow,
+    publish_workflow,
+    publishers: publishers as Publisher[],
     version_files: version_files as string[],
     required_artifacts: required_artifacts as string[],
     auto_promote: raw.auto_promote === true,

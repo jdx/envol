@@ -71,6 +71,30 @@ fn main() -> Result<()> {
                 bail!("Missing {field}");
             }
         }
+        validate_workflow_name(&doc, "workflow")?;
+        if doc.get("publish_workflow").is_some() {
+            validate_workflow_name(&doc, "publish_workflow")?;
+        }
+        if let Some(publishers) = doc.get("publishers") {
+            let publishers = publishers
+                .as_array()
+                .context("publishers must be an array")?;
+            if publishers.is_empty() {
+                bail!("publishers must not be empty");
+            }
+            let mut seen = std::collections::HashSet::new();
+            for publisher in publishers {
+                let publisher = publisher
+                    .as_str()
+                    .context("publishers entries must be strings")?;
+                if !matches!(publisher, "github" | "crates") {
+                    bail!("Unsupported publisher: {publisher}");
+                }
+                if !seen.insert(publisher) {
+                    bail!("Duplicate publisher: {publisher}");
+                }
+            }
+        }
         println!("{}: configuration syntax is valid", file.display());
         return Ok(());
     }
@@ -121,6 +145,23 @@ fn main() -> Result<()> {
         None => client.get(url),
     };
     print_response(request.bearer_auth(token).send()?)
+}
+
+fn validate_workflow_name(doc: &toml::Value, field: &str) -> Result<()> {
+    let value = doc
+        .get(field)
+        .and_then(toml::Value::as_str)
+        .with_context(|| format!("{field} must be a string"))?;
+    let valid = !value.is_empty()
+        && !value.contains('/')
+        && (value.ends_with(".yml") || value.ends_with(".yaml"))
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "-_.".contains(character));
+    if !valid {
+        bail!("{field} must be a YAML filename");
+    }
+    Ok(())
 }
 
 fn validate_server(server: &str) -> Result<()> {

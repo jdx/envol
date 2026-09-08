@@ -117,6 +117,14 @@ export class Store {
       ),
     );
   }
+  async defer(id: string, fence: number) {
+    return Boolean(
+      await this.db.run(
+        "UPDATE jobs SET state='pending',lease_until=0,error=NULL WHERE id=? AND fence=? AND state='running'",
+        [id, fence],
+      ),
+    );
+  }
   async succeed(id: string, candidateId: string, fence: number) {
     await this.db.batch([
       {

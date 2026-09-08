@@ -10,18 +10,29 @@ import {
   configFromToml,
   releaseVersion,
   nextVersion,
+  type Artifact,
   type Line,
 } from "../src/model.ts";
 import { LocalStorage } from "../src/local-storage.ts";
-import { bumpFile, Engine } from "../src/engine.ts";
+import {
+  bumpFile,
+  Engine,
+  verifyCratesPublication,
+  verifyGitHubPublication,
+} from "../src/engine.ts";
 import { app, collectMetrics, githubForMetrics } from "../src/app.ts";
 import { GitHub } from "../src/github.ts";
 import { milestone } from "../src/metrics.ts";
 import { Miniflare, convertV4MiniflareOptions } from "miniflare";
-const schema = await readFile(
+const initialSchema = await readFile(
   new URL("../migrations/0001_initial.sql", import.meta.url),
   "utf8",
 );
+const publishWorkflowMigration = await readFile(
+  new URL("../migrations/0003_publish_workflow.sql", import.meta.url),
+  "utf8",
+);
+const schema = `${initialSchema}\n${publishWorkflowMigration}`;
 const runtimeStateMigration = await readFile(
   new URL("../migrations/0002_runtime_state.sql", import.meta.url),
   "utf8",
@@ -159,12 +170,103 @@ test("configuration validates paths, release lines and exact artifact inventory"
     new URL("../envol.toml", import.meta.url),
     "utf8",
   );
-  assert.equal(configFromToml(source).lines.stable.branch, "main");
+  const config = configFromToml(source);
+  assert.equal(config.lines.stable.branch, "main");
+  assert.equal(config.publish_workflow, "envol-publish.yml");
+  assert.deepEqual(config.publishers, ["github", "crates"]);
   assert.throws(() =>
     configFromToml(source.replace('"Cargo.toml"', '"../Cargo.toml"')),
   );
   assert.throws(() =>
     configFromToml(source + '\n[lines.other]\nbranch="main"\nchannel="beta"'),
+  );
+  assert.throws(() => configFromToml(source.replace('"crates"', '"npm"')));
+  assert.throws(() =>
+    configFromToml(
+      source.replace('["github", "crates"]', '["github", "github"]'),
+    ),
+  );
+});
+
+const retainedArtifacts: Artifact[] = [
+  {
+    candidate_id: "candidate",
+    name: "envol-linux-x64.tar.gz",
+    digest: "a".repeat(64),
+    size: 12,
+    storage_key: "artifact",
+  },
+  {
+    candidate_id: "candidate",
+    name: "envol-1.0.0.crate",
+    digest: "b".repeat(64),
+    size: 34,
+    storage_key: "crate",
+  },
+];
+
+test("GitHub publication verification requires every retained asset digest", async () => {
+  class ReleaseGitHub extends GitHub {
+    constructor(
+      private readonly assets: { name: string; digest: string | null }[],
+    ) {
+      super("read-only");
+    }
+    override async optional<T>(): Promise<T> {
+      return { id: 42, draft: false, assets: this.assets } as T;
+    }
+  }
+  const valid = retainedArtifacts.map((artifact) => ({
+    name: artifact.name,
+    digest: `sha256:${artifact.digest}`,
+  }));
+  assert.equal(
+    await verifyGitHubPublication(
+      new ReleaseGitHub(valid),
+      "owner/repo",
+      "v1.0.0",
+      retainedArtifacts,
+    ),
+    "42",
+  );
+  await assert.rejects(
+    () =>
+      verifyGitHubPublication(
+        new ReleaseGitHub(valid.slice(0, 1)),
+        "owner/repo",
+        "v1.0.0",
+        retainedArtifacts,
+      ),
+    /missing asset envol-1.0.0.crate/,
+  );
+  await assert.rejects(
+    () =>
+      verifyGitHubPublication(
+        new ReleaseGitHub([
+          { ...valid[0], digest: `sha256:${"c".repeat(64)}` },
+          valid[1],
+        ]),
+        "owner/repo",
+        "v1.0.0",
+        retainedArtifacts,
+      ),
+    /digest mismatch/,
+  );
+});
+
+test("crates.io verification checks the retained package checksum", async () => {
+  const fetcher: typeof fetch = async () =>
+    Response.json({ version: { checksum: "b".repeat(64) } });
+  assert.equal(
+    await verifyCratesPublication("1.0.0", retainedArtifacts, fetcher),
+    "envol@1.0.0",
+  );
+  await assert.rejects(
+    () =>
+      verifyCratesPublication("1.0.0", retainedArtifacts, async () =>
+        Response.json({ version: { checksum: "c".repeat(64) } }),
+      ),
+    /digest mismatch/,
   );
 });
 test("version edits support Cargo workspaces and package.json", () => {
@@ -182,6 +284,24 @@ test("version edits support Cargo workspaces and package.json", () => {
   assert.throws(() =>
     bumpFile("Cargo.toml", '[package]\nname="test"', "2.0.0"),
   );
+  assert.equal(
+    bumpFile(
+      "Cargo.lock",
+      'version = 4\n\n[[package]]\nname = "envol"\nversion = "1.0.0"\n\n[[package]]\nname = "other"\nversion = "1.0.0"\n',
+      "2.0.0",
+      "envol",
+    ),
+    'version = 4\n\n[[package]]\nname = "envol"\nversion = "2.0.0"\n\n[[package]]\nname = "other"\nversion = "1.0.0"\n',
+  );
+  const packageLock = JSON.parse(
+    bumpFile(
+      "package-lock.json",
+      '{"version":"1.0.0","packages":{"":{"version":"1.0.0"}}}',
+      "2.0.0",
+    ),
+  );
+  assert.equal(packageLock.version, "2.0.0");
+  assert.equal(packageLock.packages[""].version, "2.0.0");
 });
 
 test("milestones use the nearest point before the trailing cutoff", () => {
